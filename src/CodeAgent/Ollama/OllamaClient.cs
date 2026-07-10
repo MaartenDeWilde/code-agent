@@ -71,6 +71,17 @@ class OllamaClient
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
+    /// <summary>Names of the models installed on the Ollama server (GET /api/tags).</summary>
+    public async Task<List<string>> ListModelsAsync()
+    {
+        using var doc = JsonDocument.Parse(await _http.GetStringAsync("/api/tags"));
+        return doc.RootElement.GetProperty("models").EnumerateArray()
+            .Select(m => m.GetProperty("name").GetString() ?? "")
+            .Where(name => name.Length > 0)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     /// <summary>
     /// Sends the conversation to the model and streams the reply.
     /// Text tokens are passed to <paramref name="onToken"/> as they arrive;

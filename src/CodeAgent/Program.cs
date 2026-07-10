@@ -1,4 +1,5 @@
 using CodeAgent.Agent;
+using CodeAgent.Ollama;
 
 static void DisplayLogo()
 {
@@ -51,6 +52,7 @@ Console.WriteLine("Commands:");
 Console.WriteLine("  <task>       give the agent a task to execute");
 Console.WriteLine("  plan <task>  investigate and propose a plan without changing files");
 Console.WriteLine("  go           execute the most recent plan");
+Console.WriteLine("  model [name] show installed models, or switch to another model");
 Console.WriteLine("  clear        reset the conversation");
 Console.WriteLine("  exit         quit");
 Console.WriteLine();
@@ -86,6 +88,46 @@ while (true)
     {
         agent = new CodingAgent(rootFolder, model, contextTokens);
         Console.WriteLine("[conversation cleared]");
+        continue;
+    }
+    if (task.Equals("model", StringComparison.OrdinalIgnoreCase)
+        || task.StartsWith("model ", StringComparison.OrdinalIgnoreCase))
+    {
+        var requested = task.Length > 5 ? task[6..].Trim() : "";
+
+        // The installed list validates switches and powers the overview;
+        // if Ollama can't be reached we still allow switching blind.
+        List<string> installed = [];
+        try
+        {
+            installed = await new OllamaClient().ListModelsAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[could not list models from Ollama: {ex.Message}]");
+        }
+
+        if (requested.Length == 0)
+        {
+            Console.WriteLine($"Current model: {model}");
+            foreach (var name in installed)
+            {
+                Console.WriteLine($"  {(name == model ? "*" : " ")} {name}");
+            }
+            Console.WriteLine("Switch with: model <name>");
+            continue;
+        }
+
+        if (installed.Count > 0 && !installed.Contains(requested))
+        {
+            Console.WriteLine($"Model '{requested}' is not installed. Type 'model' to see the installed list.");
+            continue;
+        }
+
+        // Takes effect on the next request; conversation history is kept.
+        model = requested;
+        agent.Model = requested;
+        Console.WriteLine($"[model switched to {model}]");
         continue;
     }
 

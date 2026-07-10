@@ -14,7 +14,8 @@ class CodingAgent
     // Build/fix cycles take many steps; give the agent room to iterate.
     private const int MaxSteps = 30;
 
-    private readonly string _model;
+    /// <summary>The Ollama model in use; may be switched between tasks.</summary>
+    public string Model { get; set; }
     private readonly int _contextTokens;
     private readonly OllamaClient _ollama = new();
     private readonly AgentTools _tools;
@@ -26,7 +27,7 @@ class CodingAgent
 
     public CodingAgent(string rootFolder, string model, int contextTokens)
     {
-        _model = model;
+        Model = model;
         _contextTokens = contextTokens;
 
         // Trim the transcript at ~80% of the window (at ~4 chars per token),
@@ -74,7 +75,7 @@ class CodingAgent
             {
                 // Stream tokens straight to the console; the spinner is only
                 // visible until the first token arrives.
-                response = await _ollama.ChatAsync(_model, _history.Messages, tools, _contextTokens,
+                response = await _ollama.ChatAsync(Model, _history.Messages, tools, _contextTokens,
                     onToken: text =>
                     {
                         spinner.Stop();
@@ -160,7 +161,7 @@ class CodingAgent
     private void PrintContextSize()
     {
         var chars = _history.TotalChars;
-        var line = $"[context: {chars:N0} chars, {100L * chars / _history.MaxChars}% of budget";
+        var line = $"[{Model} | context: {chars:N0} chars, {100L * chars / _history.MaxChars}% of budget";
         line += _lastStats is { } stats
             ? $" | last request: {stats.PromptTokens:N0} prompt + {stats.ReplyTokens:N0} reply tokens, {stats.TokensPerSecond:F1} tok/s]"
             : $" (~{chars / 4:N0} tokens)]";

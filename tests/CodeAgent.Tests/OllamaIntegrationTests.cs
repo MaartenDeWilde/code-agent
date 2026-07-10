@@ -82,6 +82,17 @@ public class OllamaIntegrationTests
     }
 
     [Fact]
+    public async Task ListModelsAsync_ReturnsInstalledModels()
+    {
+        var client = new OllamaClient();
+
+        var models = await client.ListModelsAsync();
+
+        Assert.NotEmpty(models);
+        Assert.Contains(Model, models); // the test model must be installed
+    }
+
+    [Fact]
     public async Task ChatAsync_CancellationAbortsTheStream()
     {
         var client = new OllamaClient();

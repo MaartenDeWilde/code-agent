@@ -1,6 +1,13 @@
 using CodeAgent.Agent;
 
-Console.WriteLine("=== Simple Local Coding Agent ===");
+static void DisplayLogo()
+{
+    Console.ForegroundColor = ConsoleColor.Blue;    
+    Console.WriteLine("      Mantares Coding Agent");
+    Console.ResetColor();
+}
+
+DisplayLogo();
 Console.WriteLine();
 
 // --- 1. Ask for the folder the agent is allowed to work in ---

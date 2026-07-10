@@ -102,6 +102,9 @@ class CodingAgent
             catch (Exception)
             {
                 Console.WriteLine("[agent returned invalid JSON, asking it to retry]");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  {Snippet(raw)}");
+                Console.ResetColor();
                 _history.Add(new ChatMessage("user",
                     "Your last reply was not valid JSON matching the required schema. Reply again with ONLY the JSON object."));
                 continue;
@@ -124,6 +127,12 @@ class CodingAgent
         }
 
         Console.WriteLine("[agent stopped: reached max steps without a final answer]");
+    }
+
+    private static string Snippet(string raw)
+    {
+        var oneLine = raw.Replace("\r", "").Replace("\n", " ");
+        return oneLine.Length > 200 ? oneLine[..200] + "..." : oneLine;
     }
 
     private static string Summarize(AgentAction action, string result)
@@ -308,6 +317,7 @@ static class Spinner
         var i = 0;
         try
         {
+            Console.ForegroundColor = ConsoleColor.Cyan;
             while (!token.IsCancellationRequested)
             {
                 Console.Write($"\r{frames[i++ % frames.Length]} thinking...");
@@ -319,6 +329,7 @@ static class Spinner
         }
         finally
         {
+            Console.ResetColor();
             // Erase the spinner line.
             Console.Write("\r" + new string(' ', 20) + "\r");
         }

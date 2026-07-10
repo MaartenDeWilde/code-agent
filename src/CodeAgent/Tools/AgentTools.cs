@@ -3,6 +3,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
+namespace CodeAgent.Tools;
+
 /// <summary>
 /// The tools the model can call, plus the sandboxing and confirmation rules
 /// around them. All file access is restricted to the chosen working folder,

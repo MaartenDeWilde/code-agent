@@ -1,3 +1,5 @@
+using CodeAgent.Agent;
+
 Console.WriteLine("=== Simple Local Coding Agent ===");
 Console.WriteLine();
 

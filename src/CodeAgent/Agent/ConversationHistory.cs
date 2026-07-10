@@ -1,4 +1,7 @@
 using System.Text.Json;
+using CodeAgent.Ollama;
+
+namespace CodeAgent.Agent;
 
 /// <summary>
 /// Holds the chat transcript and keeps it within a rough size budget so long

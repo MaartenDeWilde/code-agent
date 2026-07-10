@@ -1,3 +1,9 @@
+using CodeAgent.Ollama;
+using CodeAgent.Tools;
+using CodeAgent.Ui;
+
+namespace CodeAgent.Agent;
+
 /// <summary>
 /// The agent loop: send the conversation to the model, execute the tool calls
 /// it makes, feed the results back, and repeat until the model answers with

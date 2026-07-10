@@ -1,5 +1,7 @@
 using System.Text;
 
+namespace CodeAgent.Tools;
+
 /// <summary>
 /// Builds a compact description of the project — a shallow folder tree plus
 /// the key configuration files (.sln/.csproj, package.json, angular.json) —

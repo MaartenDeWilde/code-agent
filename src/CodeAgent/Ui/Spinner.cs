@@ -1,3 +1,5 @@
+namespace CodeAgent.Ui;
+
 /// <summary>
 /// Small console spinner shown while waiting for the model's first token.
 /// Start it with <see cref="Start"/>, then call <see cref="Stop"/> (safe to

@@ -2,6 +2,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+namespace CodeAgent.Ollama;
+
 // ======================================================================
 // Chat message / tool call models shared between the client and the agent.
 // Property names follow Ollama's wire format (snake_case).

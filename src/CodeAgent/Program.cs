@@ -11,15 +11,21 @@ static void DisplayLogo()
 DisplayLogo();
 Console.WriteLine();
 
+// Clear terminal screen on startup
+Console.Clear();
+
 // --- 1. Ask for the folder the agent is allowed to work in ---
 string rootFolder;
 while (true)
 {
-    Console.Write("Input folder (the agent will only read/write inside this folder): ");
+    Console.Write("Input folder (the agent will only read/write inside this folder, or press Enter for current directory): ");
     var input = Console.ReadLine()?.Trim().Trim('"');
+    
+    // Empty string means use the current directory "."
     if (string.IsNullOrWhiteSpace(input))
     {
-        continue;
+        rootFolder = Directory.GetCurrentDirectory();
+        break;
     }
 
     var fullPath = Path.GetFullPath(input);

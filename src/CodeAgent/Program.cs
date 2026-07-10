@@ -33,9 +33,9 @@ while (true)
 }
 
 // --- 2. Pick the model (needs native tool-calling support: qwen, llama3.1+, ...) ---
-Console.Write("Model to use [gemma4:12b-mlx]: ");
+Console.Write("Model to use [qwen3.5:9b]: ");
 var modelInput = Console.ReadLine()?.Trim();
-var model = string.IsNullOrWhiteSpace(modelInput) ? "gemma4:12b-mlx" : modelInput;
+var model = string.IsNullOrWhiteSpace(modelInput) ? "qwen3.5:9b" : modelInput;
 
 // --- 3. Context window: sent to Ollama as num_ctx and used for trimming ---
 Console.Write("Context window in tokens [262144]: ");

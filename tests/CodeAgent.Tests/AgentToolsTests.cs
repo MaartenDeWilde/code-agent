@@ -276,6 +276,112 @@ public class AgentToolsTests : IDisposable
         Assert.Contains("best judgment", result);
     }
 
+    // ---------------- sandbox escapes ----------------
+    // The path/pattern arguments come straight from model JSON; none of the
+    // shapes below may ever touch anything outside the working folder.
+
+    [Fact]
+    public async Task WriteFile_PathTraversal_IsDenied()
+    {
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "../escaped.txt", content = "pwned" }));
+
+        Assert.Contains("outside the working folder", result);
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(_root)!, "escaped.txt")));
+    }
+
+    [Fact]
+    public async Task WriteFile_AbsolutePath_IsDenied()
+    {
+        var outside = Path.Combine(Path.GetTempPath(), $"escaped-{Guid.NewGuid():N}.txt");
+
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = outside, content = "pwned" }));
+
+        Assert.Contains("outside the working folder", result);
+        Assert.False(File.Exists(outside));
+    }
+
+    [Fact]
+    public async Task EditFile_PathTraversal_IsDenied()
+    {
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "../../etc/hosts", find = "localhost", replace = "evil" }));
+
+        Assert.Contains("outside the working folder", result);
+    }
+
+    [Fact]
+    public async Task WriteFile_ThroughSymlink_IsDenied()
+    {
+        // A symlink inside the folder pointing outside would pass a purely
+        // textual path check; it must be refused.
+        var outside = Directory.CreateTempSubdirectory("symlink-target-").FullName;
+        try
+        {
+            Directory.CreateSymbolicLink(Path.Combine(_root, "link"), outside);
+
+            var result = await _tools.ExecuteAsync("write_file",
+                Args(new { path = "link/escaped.txt", content = "pwned" }));
+
+            Assert.Contains("symbolic link", result);
+            Assert.False(File.Exists(Path.Combine(outside, "escaped.txt")));
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ReadFile_ThroughSymlink_IsDenied()
+    {
+        var outside = Directory.CreateTempSubdirectory("symlink-target-").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(outside, "secret.txt"), "secret data");
+            Directory.CreateSymbolicLink(Path.Combine(_root, "link"), outside);
+
+            var result = await _tools.ExecuteAsync("read_file",
+                Args(new { path = "link/secret.txt" }));
+
+            Assert.Contains("symbolic link", result);
+            Assert.DoesNotContain("secret data", result);
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ListFiles_PatternWithTraversal_IsRejected()
+    {
+        // Marker file just outside the sandbox root.
+        var marker = Path.Combine(Path.GetDirectoryName(_root)!, $"marker-{Guid.NewGuid():N}.txt");
+        File.WriteAllText(marker, "outside");
+        try
+        {
+            var result = await _tools.ExecuteAsync("list_files", Args(new { pattern = "../*" }));
+
+            Assert.StartsWith("Error:", result);
+            Assert.DoesNotContain(Path.GetFileName(marker), result);
+        }
+        finally
+        {
+            File.Delete(marker);
+        }
+    }
+
+    [Fact]
+    public async Task SearchFiles_PatternWithSeparators_IsRejected()
+    {
+        var result = await _tools.ExecuteAsync("search_files",
+            Args(new { pattern = "secret", file_pattern = "../**/*" }));
+
+        Assert.StartsWith("Error:", result);
+    }
+
     // ---------------- dispatch ----------------
 
     [Fact]

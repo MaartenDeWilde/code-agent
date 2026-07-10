@@ -144,11 +144,22 @@ class AgentTools
     // ------------------------------------------------------------------
 
     // Relative paths of all files under the root, with clutter filtered out.
-    private IEnumerable<string> EnumerateSourceFiles(string pattern) =>
-        Directory.EnumerateFiles(_rootFolder, pattern, SearchOption.AllDirectories)
+    private IEnumerable<string> EnumerateSourceFiles(string pattern)
+    {
+        // The glob is model-controlled input. It is a filename filter, not a
+        // path: refuse separators and '..' so it can never reach outside the
+        // working folder, whatever Directory.EnumerateFiles would do with it.
+        if (pattern.Contains("..") || pattern.Contains('/') || pattern.Contains('\\'))
+        {
+            throw new ArgumentException(
+                $"pattern '{pattern}' must be a plain filename glob like '*.cs', without path separators or '..'");
+        }
+
+        return Directory.EnumerateFiles(_rootFolder, pattern, SearchOption.AllDirectories)
             .Select(f => Path.GetRelativePath(_rootFolder, f))
             .Where(rel => !rel.Split(Path.DirectorySeparatorChar)
                 .Any(segment => IgnoredFolders.Contains(segment, StringComparer.OrdinalIgnoreCase)));
+    }
 
     private string ListFiles(string pattern)
     {
@@ -445,12 +456,51 @@ class AgentTools
             ? _rootFolder
             : _rootFolder + Path.DirectorySeparatorChar;
 
+        // Textual containment: GetFullPath has normalized away '..' segments,
+        // and an absolute input to Path.Combine simply replaces the root, so
+        // anything that still starts with the root prefix is textually inside.
         if (!combined.StartsWith(rootWithSep, StringComparison.Ordinal) && combined != _rootFolder)
         {
             throw new UnauthorizedAccessException($"path '{relativePath}' is outside the working folder");
         }
 
+        // Physical containment: GetFullPath is purely textual and does NOT
+        // resolve symlinks, so 'link/file' where link points elsewhere would
+        // pass the check above yet land outside the folder. Refuse any
+        // symlink on the way to the target.
+        RejectSymlinkComponents(combined, relativePath);
+
         return combined;
+    }
+
+    // Walks each path component below the root and throws if one is a
+    // symbolic link. (The root itself may be a symlink — e.g. /tmp on macOS —
+    // that's the user's explicit choice and is trusted.)
+    private void RejectSymlinkComponents(string fullPath, string originalInput)
+    {
+        var remainder = Path.GetRelativePath(_rootFolder, fullPath);
+        if (remainder == ".")
+        {
+            return;
+        }
+
+        var current = _rootFolder;
+        foreach (var component in remainder.Split(Path.DirectorySeparatorChar))
+        {
+            current = Path.Combine(current, component);
+
+            // LinkTarget is non-null only for symlinks; DirectoryInfo vs
+            // FileInfo matters for directories, and FileInfo still reports
+            // dangling links whose target no longer exists.
+            FileSystemInfo info = Directory.Exists(current)
+                ? new DirectoryInfo(current)
+                : new FileInfo(current);
+            if (info.LinkTarget is not null)
+            {
+                throw new UnauthorizedAccessException(
+                    $"path '{originalInput}' goes through the symbolic link '{component}', which could point outside the working folder");
+            }
+        }
     }
 
     // Asks the user for a y/n confirmation before a destructive action.

@@ -34,6 +34,12 @@ class AgentTools
     // caller relative to the model's context window.
     private readonly int _maxResultChars;
 
+    // Session-scoped approvals collected via the 'a' confirmation answer:
+    // full paths whose overwrites are pre-approved, and exact command
+    // strings that may run without asking again.
+    private readonly HashSet<string> _approvedOverwrites = new();
+    private readonly HashSet<string> _approvedCommands = new();
+
     public AgentTools(string rootFolder, int maxResultChars)
     {
         _rootFolder = rootFolder;
@@ -68,7 +74,7 @@ class AgentTools
             }, "pattern"),
 
         ["write_file"] = Tool("write_file",
-            "Create a new file or fully overwrite an existing one. Prefer edit_file for small changes.",
+            "Create a new file, writing its COMPLETE content in one call. To change an existing file use edit_file instead: rewrites that keep most of the existing content are rejected.",
             new
             {
                 path = Param("string", "File path relative to the working folder"),
@@ -287,11 +293,33 @@ class AgentTools
         if (File.Exists(fullPath))
         {
             var existing = File.ReadAllText(fullPath);
-            Console.WriteLine();
-            Console.WriteLine($"The agent wants to overwrite '{relativePath}' ({CountLines(existing)} lines -> {CountLines(content)} lines).");
-            if (!Confirm("Allow overwrite?"))
+
+            // Models tend to regenerate a whole file to change (or worse,
+            // truncate) a small part of it. Redirect those to edit_file
+            // instead of executing them.
+            if (content == existing)
             {
-                return "User declined the overwrite. Consider edit_file for a smaller change, or ask the user how to proceed.";
+                return $"No change: {relativePath} already has exactly this content.";
+            }
+            if (IsMostlyUnchanged(existing, content))
+            {
+                return "Error: most of this content is already in the existing file. Do not rewrite " +
+                       "the whole file; use edit_file with an exact 'find' snippet and 'replace' text " +
+                       "for just the part you want to change.";
+            }
+
+            if (!_approvedOverwrites.Contains(fullPath))
+            {
+                Console.WriteLine();
+                Console.WriteLine($"The agent wants to overwrite '{relativePath}' ({CountLines(existing)} lines -> {CountLines(content)} lines).");
+                switch (Confirm("Allow overwrite?"))
+                {
+                    case ConfirmResult.No:
+                        return "User declined the overwrite. Consider edit_file for a smaller change, or ask the user how to proceed.";
+                    case ConfirmResult.Always:
+                        _approvedOverwrites.Add(fullPath);
+                        break;
+                }
             }
         }
 
@@ -356,12 +384,20 @@ class AgentTools
         }
 
         // Shell access is the most dangerous tool; every command needs an
-        // explicit go-ahead from the user.
-        Console.WriteLine();
-        Console.WriteLine($"The agent wants to run: {command}");
-        if (!Confirm("Allow?"))
+        // explicit go-ahead from the user, unless this exact command was
+        // already session-approved with 'a' (useful for build/test loops).
+        if (!_approvedCommands.Contains(command))
         {
-            return "User declined to run the command.";
+            Console.WriteLine();
+            Console.WriteLine($"The agent wants to run: {command}");
+            switch (Confirm("Allow?"))
+            {
+                case ConfirmResult.No:
+                    return "User declined to run the command.";
+                case ConfirmResult.Always:
+                    _approvedCommands.Add(command);
+                    break;
+            }
         }
 
         var psi = new ProcessStartInfo
@@ -503,14 +539,59 @@ class AgentTools
         }
     }
 
-    // Asks the user for a y/n confirmation before a destructive action.
-    private static bool Confirm(string question)
+    private enum ConfirmResult { No, Yes, Always }
+
+    // Asks the user to confirm a destructive action. 'a' approves this
+    // overwrite target / exact command for the rest of the session, so
+    // iterative work doesn't prompt on every step.
+    private static ConfirmResult Confirm(string question)
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.Write($"{question} [y/N] ");
+        Console.Write($"{question} [y]es / [a]lways this session / [N]o ");
         Console.ResetColor();
-        var answer = Console.ReadLine()?.Trim();
-        return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase);
+        return Console.ReadLine()?.Trim().ToLowerInvariant() switch
+        {
+            "y" or "yes" => ConfirmResult.Yes,
+            "a" or "always" => ConfirmResult.Always,
+            _ => ConfirmResult.No
+        };
+    }
+
+    // True when the bulk of the proposed content already exists in the file,
+    // i.e. the model is rewriting a file to change — or truncate — a small
+    // part of it. Trivial lines like '}' are ignored so brace-heavy code
+    // doesn't look more similar than it is; small files may always be
+    // rewritten, since an edit would hardly be cheaper.
+    private static bool IsMostlyUnchanged(string existing, string proposed)
+    {
+        static List<string> SignificantLines(string text) =>
+            text.Split('\n').Select(line => line.Trim()).Where(line => line.Length > 3).ToList();
+
+        var oldLines = SignificantLines(existing);
+        var newLines = SignificantLines(proposed);
+        if (oldLines.Count < 10 || newLines.Count == 0)
+        {
+            return false;
+        }
+
+        // Multiset intersection: how many proposed lines the file already has.
+        var available = new Dictionary<string, int>();
+        foreach (var line in oldLines)
+        {
+            available[line] = available.GetValueOrDefault(line) + 1;
+        }
+
+        var shared = 0;
+        foreach (var line in newLines)
+        {
+            if (available.TryGetValue(line, out var count) && count > 0)
+            {
+                available[line] = count - 1;
+                shared++;
+            }
+        }
+
+        return shared >= newLines.Count * 0.8;
     }
 
     // Keeps the *tail* of long command output: build/test errors usually
@@ -526,7 +607,8 @@ class AgentTools
     private static string StripLineNumbers(string text) =>
         Regex.Replace(text, @"^\s*\d+: ", "", RegexOptions.Multiline);
 
-    private static int? GetInt(JsonElement args, string name) =>
+    // Also used by CodingAgent to describe tool calls on the console.
+    internal static int? GetInt(JsonElement args, string name) =>
         args.ValueKind == JsonValueKind.Object && args.TryGetProperty(name, out var value)
             ? value.ValueKind switch
             {
@@ -537,7 +619,7 @@ class AgentTools
             }
             : null;
 
-    private static string? GetString(JsonElement args, string name) =>
+    internal static string? GetString(JsonElement args, string name) =>
         args.ValueKind == JsonValueKind.Object
         && args.TryGetProperty(name, out var value)
         && value.ValueKind == JsonValueKind.String

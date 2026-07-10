@@ -53,22 +53,26 @@ class CodingAgent
     {
         _history.AddUser(planMode ? WrapPlanTask(task) : task);
         var tools = planMode ? AgentTools.PlanDefinitions : AgentTools.Definitions;
+        var activity = new TaskActivity();
 
         try
         {
-            await RunLoopAsync(tools, planMode, cancellationToken);
+            await RunLoopAsync(tools, planMode, activity, cancellationToken);
         }
         finally
         {
-            // Always show how full the context is, whichever way the task ended.
+            // Whichever way the task ended, recap what happened and show how
+            // full the context is.
+            PrintTaskSummary(activity);
             PrintContextSize();
         }
     }
 
-    private async Task RunLoopAsync(object[] tools, bool planMode, CancellationToken cancellationToken)
+    private async Task RunLoopAsync(object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
     {
         for (var step = 0; step < MaxSteps; step++)
         {
+            activity.Turns++;
             ChatResponse response;
             var spinner = Spinner.Start();
             try
@@ -79,6 +83,8 @@ class CodingAgent
                     onToken: text =>
                     {
                         spinner.Stop();
+                        // The model's own words stand out from tool chatter.
+                        Console.ForegroundColor = ConsoleColor.Green;
                         Console.Write(text);
                     },
                     cancellationToken);
@@ -88,6 +94,7 @@ class CodingAgent
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 spinner.Stop();
+                Console.ResetColor(); // tokens may have been streaming in green
                 Console.WriteLine();
                 Console.WriteLine("[task interrupted]");
                 // Tell the model why the transcript just stops mid-step.
@@ -97,10 +104,12 @@ class CodingAgent
             catch (Exception ex)
             {
                 spinner.Stop();
+                Console.ResetColor(); // tokens may have been streaming in green
                 Console.WriteLine($"[error talking to Ollama: {ex.Message}]");
                 return;
             }
             spinner.Stop();
+            Console.ResetColor();
 
             _lastStats = response.Stats ?? _lastStats;
 
@@ -136,7 +145,10 @@ class CodingAgent
                 var result = planMode && !AgentTools.IsAllowedInPlanMode(name)
                     ? $"Error: '{name}' is not available in plan mode. Only investigate and ask questions, then present your plan."
                     : await _tools.ExecuteAsync(name, call.Function.Arguments);
-                Console.WriteLine($"[{name}] {Summarize(result)}");
+                activity.Record(name, call.Function.Arguments);
+                Console.ForegroundColor = ConsoleColor.DarkCyan;
+                Console.WriteLine($"[{name}] {DescribeCall(name, call.Function.Arguments, result)}");
+                Console.ResetColor();
                 _history.AddToolResult(name, result);
 
                 // Honor Ctrl+C between tool calls too, not just while the
@@ -171,6 +183,103 @@ class CodingAgent
         Console.ResetColor();
     }
 
+    // The console line for a tool call. For read_file the file name is
+    // enough — its content goes to the model, not the terminal. Errors are
+    // still shown so the user sees what went wrong.
+    private static string DescribeCall(string name, System.Text.Json.JsonElement args, string result)
+    {
+        if (name == "read_file" && !result.StartsWith("Error") && !result.StartsWith("File not found"))
+        {
+            var path = AgentTools.GetString(args, "path") ?? "?";
+            var from = AgentTools.GetInt(args, "start_line");
+            var to = AgentTools.GetInt(args, "end_line");
+            return from is null && to is null ? path : $"{path} (lines {from?.ToString() ?? "1"}-{to?.ToString() ?? "end"})";
+        }
+
+        return Summarize(result);
+    }
+
+    // Recap printed when a task ends, e.g.:
+    //   [task summary: 7 turns]
+    //     read:   Program.cs, src/App.cs
+    //     edited: src/App.cs
+    //     ran:    dotnet build
+    private static void PrintTaskSummary(TaskActivity activity)
+    {
+        // A plain question answered without tools needs no recap.
+        if (!activity.UsedAnyTool)
+        {
+            return;
+        }
+
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine($"[task summary: {activity.Turns} {(activity.Turns == 1 ? "turn" : "turns")}]");
+        PrintSummaryLine("searched", activity.Searches);
+        PrintSummaryLine("read", activity.Read);
+        PrintSummaryLine("edited", activity.Edited);
+        PrintSummaryLine("wrote", activity.Wrote);
+        PrintSummaryLine("ran", activity.Commands);
+        if (activity.QuestionsAsked > 0)
+        {
+            Console.WriteLine($"  asked:    {activity.QuestionsAsked} {(activity.QuestionsAsked == 1 ? "question" : "questions")}");
+        }
+        Console.ResetColor();
+    }
+
+    private static void PrintSummaryLine(string label, IReadOnlyList<string> items)
+    {
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        // Keep the recap scannable when the agent touched many files.
+        const int maxShown = 8;
+        var shown = string.Join(", ", items.Take(maxShown));
+        if (items.Count > maxShown)
+        {
+            shown += $" (+{items.Count - maxShown} more)";
+        }
+        Console.WriteLine($"  {label + ":",-9} {shown}");
+    }
+
+    /// <summary>What the agent did during one task, for the end-of-task recap.</summary>
+    private sealed class TaskActivity
+    {
+        public int Turns;
+        public int QuestionsAsked;
+        public readonly List<string> Searches = new();
+        public readonly List<string> Read = new();
+        public readonly List<string> Wrote = new();
+        public readonly List<string> Edited = new();
+        public readonly List<string> Commands = new();
+
+        public bool UsedAnyTool =>
+            QuestionsAsked > 0 || Searches.Count > 0 || Read.Count > 0
+            || Wrote.Count > 0 || Edited.Count > 0 || Commands.Count > 0;
+
+        public void Record(string name, System.Text.Json.JsonElement args)
+        {
+            switch (name)
+            {
+                case "search_files": AddDistinct(Searches, AgentTools.GetString(args, "pattern") ?? "?"); break;
+                case "read_file": AddDistinct(Read, AgentTools.GetString(args, "path") ?? "?"); break;
+                case "write_file": AddDistinct(Wrote, AgentTools.GetString(args, "path") ?? "?"); break;
+                case "edit_file": AddDistinct(Edited, AgentTools.GetString(args, "path") ?? "?"); break;
+                case "run_command": AddDistinct(Commands, AgentTools.GetString(args, "command") ?? "?"); break;
+                case "ask_user": QuestionsAsked++; break;
+            }
+        }
+
+        private static void AddDistinct(List<string> list, string item)
+        {
+            if (!list.Contains(item))
+            {
+                list.Add(item);
+            }
+        }
+    }
+
     private static string Summarize(string result)
     {
         var oneLine = result.Replace("\n", " ");
@@ -197,9 +306,13 @@ class CodingAgent
         read_file output prefixes each line with its number for reference;
         never copy those prefixes into edit_file or write_file content.
 
-        Prefer edit_file for small targeted changes and write_file only for
-        new files or full rewrites. After changing code, verify your work with
-        run_command (build or test) when the project has a suitable command.
+        When you create a file, write its COMPLETE final content in a single
+        write_file call — never build a file up through repeated rewrites.
+        To change an existing file, always use edit_file with a targeted
+        find/replace; write_file on an existing file is rejected unless the
+        content is substantially different. After changing code, verify your
+        work with run_command (build or test) when the project has a suitable
+        command.
 
         If the task is ambiguous or an important decision could go multiple
         ways, use ask_user to check with the user instead of guessing.

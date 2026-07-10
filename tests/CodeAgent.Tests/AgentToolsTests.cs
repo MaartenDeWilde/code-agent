@@ -114,6 +114,80 @@ public class AgentToolsTests : IDisposable
         Assert.Equal("replaced", File.ReadAllText(Path.Combine(_root, "a.txt")));
     }
 
+    // A file with enough significant lines to activate the rewrite guard.
+    private static string ManyLines(string prefix, int count) =>
+        string.Join("\n", Enumerable.Range(1, count).Select(i => $"{prefix} line number {i};"));
+
+    [Fact]
+    public async Task WriteFile_IdenticalContent_ReportsNoChange()
+    {
+        CreateFile("a.txt", "same content");
+
+        // No console input is queued: if this prompted, it would be declined.
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.txt", content = "same content" }));
+
+        Assert.StartsWith("No change", result);
+    }
+
+    [Fact]
+    public async Task WriteFile_MinorChange_RedirectsToEditFile()
+    {
+        var original = ManyLines("alpha", 20);
+        CreateFile("a.cs", original);
+        var oneLineChanged = original.Replace("alpha line number 7;", "alpha line number seven;");
+
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = oneLineChanged }));
+
+        Assert.Contains("edit_file", result);
+        Assert.Equal(original, File.ReadAllText(Path.Combine(_root, "a.cs"))); // untouched
+    }
+
+    [Fact]
+    public async Task WriteFile_Truncation_RedirectsToEditFile()
+    {
+        // The dangerous pattern: rewriting a 96-line file with only its
+        // first 15 lines. Every proposed line already exists -> rejected.
+        var original = ManyLines("alpha", 96);
+        CreateFile("a.cs", original);
+        var truncated = ManyLines("alpha", 15);
+
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = truncated }));
+
+        Assert.Contains("edit_file", result);
+        Assert.Equal(original, File.ReadAllText(Path.Combine(_root, "a.cs")));
+    }
+
+    [Fact]
+    public async Task WriteFile_SubstantiallyDifferentContent_StillAsksAndOverwrites()
+    {
+        CreateFile("a.cs", ManyLines("alpha", 20));
+        UserTypes("y\n");
+
+        var result = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = ManyLines("beta", 20) }));
+
+        Assert.StartsWith("Wrote", result);
+    }
+
+    [Fact]
+    public async Task WriteFile_AlwaysApproval_SkipsLaterPromptsForSamePath()
+    {
+        CreateFile("a.cs", ManyLines("alpha", 20));
+        UserTypes("a\n"); // approve overwrites of a.cs for the session
+
+        var first = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = ManyLines("beta", 20) }));
+        // No input queued now: a second prompt would read null and decline.
+        var second = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = ManyLines("gamma", 20) }));
+
+        Assert.StartsWith("Wrote", first);
+        Assert.StartsWith("Wrote", second);
+    }
+
     // ---------------- edit_file ----------------
 
     [Fact]
@@ -241,6 +315,19 @@ public class AgentToolsTests : IDisposable
 
         Assert.Contains("declined", result);
         Assert.False(File.Exists(Path.Combine(_root, "leak.txt")));
+    }
+
+    [Fact]
+    public async Task RunCommand_AlwaysApproval_SkipsLaterPromptsForSameCommand()
+    {
+        UserTypes("a\n"); // approve this exact command for the session
+
+        var first = await _tools.ExecuteAsync("run_command", Args(new { command = "echo hi" }));
+        // No input queued: a second prompt would read null and decline.
+        var second = await _tools.ExecuteAsync("run_command", Args(new { command = "echo hi" }));
+
+        Assert.Contains("exit code: 0", first);
+        Assert.Contains("exit code: 0", second);
     }
 
     [Fact]

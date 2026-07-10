@@ -104,6 +104,7 @@ class CodingAgent
                 Console.WriteLine("[agent returned invalid JSON, asking it to retry]");
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.WriteLine($"  {Snippet(raw)}");
+                Console.WriteLine($"  [full output saved to {DumpInvalidResponse(raw)}]");
                 Console.ResetColor();
                 _history.Add(new ChatMessage("user",
                     "Your last reply was not valid JSON matching the required schema. Reply again with ONLY the JSON object."));
@@ -127,6 +128,22 @@ class CodingAgent
         }
 
         Console.WriteLine("[agent stopped: reached max steps without a final answer]");
+    }
+
+    // Saves the unparseable model output to a timestamped file so it can be inspected.
+    private string DumpInvalidResponse(string raw)
+    {
+        var fileName = $"invalid-response-{DateTime.Now:yyyyMMdd-HHmmss-fff}.txt";
+        var path = Path.Combine(_rootFolder, fileName);
+        try
+        {
+            File.WriteAllText(path, raw);
+            return fileName;
+        }
+        catch (Exception ex)
+        {
+            return $"<failed to write {fileName}: {ex.Message}>";
+        }
     }
 
     private static string Snippet(string raw)

@@ -16,26 +16,34 @@ class AgentTools
 
     private readonly string _rootFolder;
 
-    public AgentTools(string rootFolder) => _rootFolder = rootFolder;
+    // Cap on a single tool result (file read, command output), sized by the
+    // caller relative to the model's context window.
+    private readonly int _maxResultChars;
 
-    /// <summary>Tool schemas advertised to the model via Ollama's native tool calling.</summary>
-    public static object[] Definitions =>
-    [
-        Tool("list_files",
+    public AgentTools(string rootFolder, int maxResultChars)
+    {
+        _rootFolder = rootFolder;
+        _maxResultChars = maxResultChars;
+    }
+
+    // All tool schemas, keyed by name, advertised via Ollama's native tool calling.
+    private static readonly Dictionary<string, object> AllDefinitions = new()
+    {
+        ["list_files"] = Tool("list_files",
             "List files in the working folder (recursively) matching a glob pattern.",
             new
             {
                 pattern = Param("string", "Glob pattern, e.g. '*.cs', '*.json' or '*' for everything")
             }, "pattern"),
 
-        Tool("read_file",
+        ["read_file"] = Tool("read_file",
             "Read a file's contents.",
             new
             {
                 path = Param("string", "File path relative to the working folder")
             }, "path"),
 
-        Tool("write_file",
+        ["write_file"] = Tool("write_file",
             "Create a new file or fully overwrite an existing one. Prefer edit_file for small changes.",
             new
             {
@@ -43,7 +51,7 @@ class AgentTools
                 content = Param("string", "The complete new file contents")
             }, "path", "content"),
 
-        Tool("edit_file",
+        ["edit_file"] = Tool("edit_file",
             "Replace an exact text snippet in an existing file. The 'find' text must appear exactly once; include enough surrounding lines to make it unique.",
             new
             {
@@ -52,13 +60,32 @@ class AgentTools
                 replace = Param("string", "The replacement text")
             }, "path", "find", "replace"),
 
-        Tool("run_command",
+        ["run_command"] = Tool("run_command",
             "Run a shell command inside the working folder and return its exit code and output. Use it to build, test or inspect the project. The user must approve each command.",
             new
             {
                 command = Param("string", "The shell command to run, e.g. 'dotnet build'")
-            }, "command")
-    ];
+            }, "command"),
+
+        ["ask_user"] = Tool("ask_user",
+            "Ask the user a clarifying question and wait for their reply. Use this when the task is ambiguous or you must choose between approaches, instead of guessing.",
+            new
+            {
+                question = Param("string", "The question to ask the user")
+            }, "question")
+    };
+
+    // Plan mode may look around and ask questions, but never change anything.
+    private static readonly string[] PlanModeTools = { "list_files", "read_file", "ask_user" };
+
+    /// <summary>Every tool, for normal execution mode.</summary>
+    public static object[] Definitions => AllDefinitions.Values.ToArray();
+
+    /// <summary>The read-only subset advertised in plan mode.</summary>
+    public static object[] PlanDefinitions =>
+        PlanModeTools.Select(name => AllDefinitions[name]).ToArray();
+
+    public static bool IsAllowedInPlanMode(string name) => PlanModeTools.Contains(name);
 
     /// <summary>Executes a tool call and returns the result text to feed back to the model.</summary>
     public async Task<string> ExecuteAsync(string name, JsonElement args)
@@ -74,7 +101,8 @@ class AgentTools
                                         GetString(args, "find") ?? "",
                                         GetString(args, "replace") ?? ""),
                 "run_command" => await RunCommandAsync(GetString(args, "command") ?? ""),
-                _ => $"Unknown tool '{name}'. Valid tools: list_files, read_file, write_file, edit_file, run_command."
+                "ask_user" => AskUser(GetString(args, "question") ?? ""),
+                _ => $"Unknown tool '{name}'. Valid tools: {string.Join(", ", AllDefinitions.Keys)}."
             };
         }
         catch (Exception ex)
@@ -110,9 +138,8 @@ class AgentTools
         }
 
         var content = File.ReadAllText(fullPath);
-        const int maxChars = 20000;
-        return content.Length > maxChars
-            ? content[..maxChars] + $"\n...[truncated, {content.Length - maxChars} more characters]"
+        return content.Length > _maxResultChars
+            ? content[.._maxResultChars] + $"\n...[truncated, {content.Length - _maxResultChars} more characters]"
             : content;
     }
 
@@ -245,6 +272,26 @@ class AgentTools
         return TruncateOutput(output.ToString());
     }
 
+    // Lets the model pause mid-task and get input from the user.
+    private static string AskUser(string question)
+    {
+        if (string.IsNullOrWhiteSpace(question))
+        {
+            return "Error: question is required.";
+        }
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        Console.WriteLine($"The agent asks: {question}");
+        Console.Write("your answer> ");
+        Console.ResetColor();
+        var answer = Console.ReadLine()?.Trim();
+
+        return string.IsNullOrWhiteSpace(answer)
+            ? "The user gave no answer. Use your best judgment."
+            : $"User answered: {answer}";
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -282,13 +329,10 @@ class AgentTools
 
     // Keeps the *tail* of long command output: build/test errors usually
     // appear at the end.
-    private static string TruncateOutput(string text)
-    {
-        const int maxChars = 8000;
-        return text.Length <= maxChars
+    private string TruncateOutput(string text) =>
+        text.Length <= _maxResultChars
             ? text
-            : $"[truncated, showing last {maxChars} of {text.Length} characters]\n" + text[^maxChars..];
-    }
+            : $"[truncated, showing last {_maxResultChars:N0} of {text.Length:N0} characters]\n" + text[^_maxResultChars..];
 
     private static int CountLines(string text) => text.Split('\n').Length;
 

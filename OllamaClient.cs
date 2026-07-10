@@ -42,7 +42,13 @@ class ToolFunction
 }
 
 /// <summary>The model's complete reply: streamed text plus any tool calls.</summary>
-record ChatResponse(string Content, List<ToolCall> ToolCalls);
+record ChatResponse(string Content, List<ToolCall> ToolCalls, ChatStats? Stats);
+
+/// <summary>
+/// Real token counts reported by Ollama in the final stream chunk — unlike
+/// our chars/4 estimate, PromptTokens is exactly what the context cost.
+/// </summary>
+record ChatStats(int PromptTokens, int ReplyTokens, double TokensPerSecond);
 
 // ======================================================================
 // Minimal Ollama HTTP client (POST /api/chat) with streaming and native
@@ -72,14 +78,19 @@ class OllamaClient
         string model,
         IReadOnlyList<ChatMessage> history,
         object[] tools,
-        Action<string> onToken)
+        int contextTokens,
+        Action<string> onToken,
+        CancellationToken cancellationToken = default)
     {
         var request = new
         {
             model,
             stream = true,
             messages = history,
-            tools
+            tools,
+            // Ollama applies its own (often small) default context length per
+            // request; ask explicitly for the window we plan around.
+            options = new { num_ctx = contextTokens }
         };
 
         var body = JsonSerializer.Serialize(request, SerializerOpts);
@@ -88,21 +99,22 @@ class OllamaClient
 
         // ResponseHeadersRead lets us start reading the stream before the
         // model has finished generating.
-        using var response = await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead);
+        using var response = await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             // Ollama puts a useful message in the body, e.g. "model X does not support tools".
-            var error = await response.Content.ReadAsStringAsync();
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
             throw new HttpRequestException($"Ollama returned {(int)response.StatusCode}: {error.Trim()}");
         }
 
         // The stream is one JSON object per line.
         var contentBuilder = new StringBuilder();
         var toolCalls = new List<ToolCall>();
+        ChatStats? stats = null;
 
-        await using var stream = await response.Content.ReadAsStreamAsync();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var reader = new StreamReader(stream);
-        while (await reader.ReadLineAsync() is { } line)
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
         {
             if (string.IsNullOrWhiteSpace(line))
             {
@@ -113,6 +125,16 @@ class OllamaClient
             if (chunk?.Error is { } chunkError)
             {
                 throw new HttpRequestException($"Ollama error: {chunkError}");
+            }
+
+            // The final chunk carries the generation statistics.
+            if (chunk is { Done: true })
+            {
+                var seconds = chunk.EvalDuration / 1_000_000_000.0;
+                stats = new ChatStats(
+                    chunk.PromptEvalCount,
+                    chunk.EvalCount,
+                    seconds > 0 ? chunk.EvalCount / seconds : 0);
             }
 
             var message = chunk?.Message;
@@ -133,7 +155,7 @@ class OllamaClient
             }
         }
 
-        return new ChatResponse(contentBuilder.ToString(), toolCalls);
+        return new ChatResponse(contentBuilder.ToString(), toolCalls, stats);
     }
 
     private class ChatChunk
@@ -146,5 +168,16 @@ class OllamaClient
 
         [JsonPropertyName("error")]
         public string? Error { get; set; }
+
+        // Statistics, only present on the final (done: true) chunk.
+        [JsonPropertyName("prompt_eval_count")]
+        public int PromptEvalCount { get; set; }
+
+        [JsonPropertyName("eval_count")]
+        public int EvalCount { get; set; }
+
+        // Nanoseconds spent generating the reply.
+        [JsonPropertyName("eval_duration")]
+        public long EvalDuration { get; set; }
     }
 }

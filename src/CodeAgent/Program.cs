@@ -2,8 +2,8 @@ using CodeAgent.Agent;
 
 static void DisplayLogo()
 {
-    Console.ForegroundColor = ConsoleColor.Blue;    
-    Console.WriteLine("      Mantares Coding Agent");
+    Console.ForegroundColor = ConsoleColor.Blue;
+    Console.WriteLine("Mantares Coding Agent");
     Console.ResetColor();
 }
 

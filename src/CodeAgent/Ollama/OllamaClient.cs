@@ -57,14 +57,24 @@ record ChatStats(int PromptTokens, int ReplyTokens, double TokensPerSecond);
 // tool calling. Requires a model with tool support (qwen, llama3.1+, ...).
 // ======================================================================
 
+/// <summary>
+/// An error Ollama reports inside an otherwise successful response stream —
+/// e.g. its parser failed on the model's tool-call syntax. These are worth
+/// retrying: a resample usually produces parseable output.
+/// </summary>
+class OllamaStreamException(string message) : Exception(message);
+
 class OllamaClient
 {
-    private readonly HttpClient _http = new()
-    {
-        BaseAddress = new Uri("http://localhost:11434"),
-        // Local models can take a while to respond; the HttpClient default of 100s is too short.
-        Timeout = TimeSpan.FromMinutes(10)
-    };
+    private readonly HttpClient _http;
+
+    public OllamaClient(HttpClient? http = null) =>
+        _http = http ?? new HttpClient
+        {
+            BaseAddress = new Uri("http://localhost:11434"),
+            // Local models can take a while to respond; the HttpClient default of 100s is too short.
+            Timeout = TimeSpan.FromMinutes(10)
+        };
 
     private static readonly JsonSerializerOptions SerializerOpts = new()
     {
@@ -137,7 +147,7 @@ class OllamaClient
             var chunk = JsonSerializer.Deserialize<ChatChunk>(line);
             if (chunk?.Error is { } chunkError)
             {
-                throw new HttpRequestException($"Ollama error: {chunkError}");
+                throw new OllamaStreamException(chunkError);
             }
 
             // The final chunk carries the generation statistics.

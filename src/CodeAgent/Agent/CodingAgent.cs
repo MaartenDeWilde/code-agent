@@ -68,8 +68,13 @@ class CodingAgent
         }
     }
 
+    // How often a reply Ollama failed to parse (malformed tool-call syntax)
+    // is retried before the task is abandoned.
+    private const int MaxStreamRetries = 3;
+
     private async Task RunLoopAsync(object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
     {
+        var streamRetries = 0;
         for (var step = 0; step < MaxSteps; step++)
         {
             activity.Turns++;
@@ -88,6 +93,28 @@ class CodingAgent
                         Console.Write(text);
                     },
                     cancellationToken);
+            }
+            // Ollama aborts the stream when it cannot parse the model's
+            // tool-call output (e.g. "XML syntax error ..."). The reply never
+            // reached the transcript, so resampling — nudged by a corrective
+            // note — usually recovers.
+            catch (OllamaStreamException ex)
+            {
+                spinner.Stop();
+                Console.ResetColor(); // tokens may have been streaming in green
+                Console.WriteLine();
+
+                if (++streamRetries > MaxStreamRetries)
+                {
+                    Console.WriteLine($"[giving up after {MaxStreamRetries} retries — Ollama keeps rejecting the model's output: {ex.Message}]");
+                    return;
+                }
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[Ollama rejected the model's reply ({ex.Message}); retrying {streamRetries}/{MaxStreamRetries}]");
+                Console.ResetColor();
+                _history.AddUser("[Your previous reply was discarded because its tool-call syntax could not be parsed. Reply again, with correctly formatted tool calls.]");
+                continue;
             }
             // Ctrl+C. The 'when' filter distinguishes a user interrupt from
             // an HttpClient timeout, which also surfaces as cancellation.

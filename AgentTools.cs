@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 /// <summary>
 /// The tools the model can call, plus the sandboxing and confirmation rules
@@ -10,9 +11,20 @@ using System.Text.Json;
 /// </summary>
 class AgentTools
 {
-    // Never listed: build output and dependency folders are huge and noisy.
-    private static readonly string[] IgnoredFolders =
-        { ".git", ".vs", ".idea", ".vscode", "bin", "obj", "node_modules", "dist", "target", "packages" };
+    // Never listed or searched: build output, caches and dependency folders
+    // are huge and noisy. Shared with ProjectOrientation.
+    public static readonly string[] IgnoredFolders =
+    {
+        ".git", ".vs", ".idea", ".vscode", "bin", "obj", "node_modules",
+        "dist", "target", "packages", ".angular", "coverage", "TestResults", ".nuget"
+    };
+
+    // Skipped when searching: binary or generated formats that only waste time.
+    private static readonly string[] UnsearchableExtensions =
+    {
+        ".dll", ".exe", ".pdb", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+        ".zip", ".gz", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".pdf", ".map", ".min.js"
+    };
 
     private readonly string _rootFolder;
 
@@ -37,11 +49,21 @@ class AgentTools
             }, "pattern"),
 
         ["read_file"] = Tool("read_file",
-            "Read a file's contents.",
+            "Read a file's contents. Each line is prefixed with its line number ('  12: code') for reference. For large files, pass start_line/end_line to read a specific range.",
             new
             {
-                path = Param("string", "File path relative to the working folder")
+                path = Param("string", "File path relative to the working folder"),
+                start_line = Param("integer", "Optional 1-based first line to read"),
+                end_line = Param("integer", "Optional 1-based last line to read (inclusive)")
             }, "path"),
+
+        ["search_files"] = Tool("search_files",
+            "Search all file contents with a regular expression (case-insensitive). Returns matching lines as 'path:line: text'. Use this to find symbols, usages or text instead of reading files one by one.",
+            new
+            {
+                pattern = Param("string", "Regular expression to search for, e.g. 'class OrderService' or 'toHaveBeenCalled'"),
+                file_pattern = Param("string", "Optional filename glob to limit the search, e.g. '*.cs' or '*.ts'. Defaults to all files.")
+            }, "pattern"),
 
         ["write_file"] = Tool("write_file",
             "Create a new file or fully overwrite an existing one. Prefer edit_file for small changes.",
@@ -52,7 +74,7 @@ class AgentTools
             }, "path", "content"),
 
         ["edit_file"] = Tool("edit_file",
-            "Replace an exact text snippet in an existing file. The 'find' text must appear exactly once; include enough surrounding lines to make it unique.",
+            "Replace an exact text snippet in an existing file. The 'find' text must appear exactly once; include enough surrounding lines to make it unique. Copy only the code itself — never include read_file's line-number prefixes.",
             new
             {
                 path = Param("string", "File path relative to the working folder"),
@@ -76,7 +98,7 @@ class AgentTools
     };
 
     // Plan mode may look around and ask questions, but never change anything.
-    private static readonly string[] PlanModeTools = { "list_files", "read_file", "ask_user" };
+    private static readonly string[] PlanModeTools = { "list_files", "read_file", "search_files", "ask_user" };
 
     /// <summary>Every tool, for normal execution mode.</summary>
     public static object[] Definitions => AllDefinitions.Values.ToArray();
@@ -95,7 +117,11 @@ class AgentTools
             return name switch
             {
                 "list_files" => ListFiles(GetString(args, "pattern") ?? "*"),
-                "read_file" => ReadFile(GetString(args, "path") ?? ""),
+                "read_file" => ReadFile(GetString(args, "path") ?? "",
+                                        GetInt(args, "start_line"),
+                                        GetInt(args, "end_line")),
+                "search_files" => SearchFiles(GetString(args, "pattern") ?? "",
+                                              GetString(args, "file_pattern") ?? "*"),
                 "write_file" => WriteFile(GetString(args, "path") ?? "", GetString(args, "content") ?? ""),
                 "edit_file" => EditFile(GetString(args, "path") ?? "",
                                         GetString(args, "find") ?? "",
@@ -115,21 +141,22 @@ class AgentTools
     // Individual tools
     // ------------------------------------------------------------------
 
-    private string ListFiles(string pattern)
-    {
-        var files = Directory.EnumerateFiles(_rootFolder, pattern, SearchOption.AllDirectories)
+    // Relative paths of all files under the root, with clutter filtered out.
+    private IEnumerable<string> EnumerateSourceFiles(string pattern) =>
+        Directory.EnumerateFiles(_rootFolder, pattern, SearchOption.AllDirectories)
             .Select(f => Path.GetRelativePath(_rootFolder, f))
             .Where(rel => !rel.Split(Path.DirectorySeparatorChar)
-                .Any(segment => IgnoredFolders.Contains(segment, StringComparer.OrdinalIgnoreCase)))
-            .Take(200)
-            .ToList();
+                .Any(segment => IgnoredFolders.Contains(segment, StringComparer.OrdinalIgnoreCase)));
 
+    private string ListFiles(string pattern)
+    {
+        var files = EnumerateSourceFiles(pattern).Take(200).ToList();
         return files.Count == 0
             ? "No files matched."
             : string.Join("\n", files);
     }
 
-    private string ReadFile(string relativePath)
+    private string ReadFile(string relativePath, int? startLine, int? endLine)
     {
         var fullPath = ResolvePath(relativePath);
         if (!File.Exists(fullPath))
@@ -137,10 +164,105 @@ class AgentTools
             return $"File not found: {relativePath}";
         }
 
-        var content = File.ReadAllText(fullPath);
-        return content.Length > _maxResultChars
-            ? content[.._maxResultChars] + $"\n...[truncated, {content.Length - _maxResultChars} more characters]"
-            : content;
+        var lines = File.ReadAllLines(fullPath);
+        var from = Math.Max(startLine ?? 1, 1);
+        var to = Math.Min(endLine ?? lines.Length, lines.Length);
+        if (from > to)
+        {
+            return $"Error: line range {from}-{endLine} is out of bounds; the file has {lines.Length} lines.";
+        }
+
+        var result = new StringBuilder();
+        if (from > 1 || to < lines.Length)
+        {
+            result.AppendLine($"[lines {from}-{to} of {lines.Length}]");
+        }
+
+        for (var lineNo = from; lineNo <= to; lineNo++)
+        {
+            result.AppendLine($"{lineNo,5}: {lines[lineNo - 1]}");
+            if (result.Length > _maxResultChars)
+            {
+                result.AppendLine($"...[truncated at line {lineNo} of {lines.Length}; call read_file with start_line={lineNo + 1} to continue]");
+                break;
+            }
+        }
+
+        return result.ToString();
+    }
+
+    private string SearchFiles(string pattern, string filePattern)
+    {
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return "Error: pattern is required.";
+        }
+
+        Regex regex;
+        try
+        {
+            // The timeout guards against catastrophic backtracking in
+            // model-written patterns.
+            regex = new Regex(pattern, RegexOptions.IgnoreCase, TimeSpan.FromSeconds(2));
+        }
+        catch (ArgumentException ex)
+        {
+            return $"Error: invalid regular expression: {ex.Message}";
+        }
+
+        const int maxMatches = 100;
+        var matches = new List<string>();
+
+        foreach (var relativePath in EnumerateSourceFiles(filePattern))
+        {
+            if (UnsearchableExtensions.Any(ext => relativePath.EndsWith(ext, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var fullPath = Path.Combine(_rootFolder, relativePath);
+            string[] lines;
+            try
+            {
+                // Skip anything huge; source files aren't megabytes.
+                if (new FileInfo(fullPath).Length > 2_000_000)
+                {
+                    continue;
+                }
+                lines = File.ReadAllLines(fullPath);
+            }
+            catch
+            {
+                continue; // unreadable file; not worth failing the search
+            }
+
+            for (var i = 0; i < lines.Length; i++)
+            {
+                try
+                {
+                    if (!regex.IsMatch(lines[i]))
+                    {
+                        continue;
+                    }
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    return "Error: the regular expression is too slow; simplify it.";
+                }
+
+                var text = lines[i].Trim();
+                matches.Add($"{relativePath}:{i + 1}: {(text.Length > 200 ? text[..200] + "..." : text)}");
+                if (matches.Count >= maxMatches)
+                {
+                    return string.Join("\n", matches)
+                        + $"\n[stopped after {maxMatches} matches — narrow the pattern or file_pattern]";
+                }
+            }
+        }
+
+        return matches.Count == 0
+            ? "No matches found."
+            : string.Join("\n", matches);
     }
 
     private string WriteFile(string relativePath, string content)
@@ -190,7 +312,19 @@ class AgentTools
         var first = content.IndexOf(find, StringComparison.Ordinal);
         if (first < 0)
         {
-            return "Error: 'find' text not found in the file. Read the file again and copy the snippet exactly, including whitespace.";
+            // Models often paste read_file's "  12: " line-number prefixes
+            // into 'find'; strip them from both fields and retry.
+            var strippedFind = StripLineNumbers(find);
+            if (strippedFind != find && content.Contains(strippedFind, StringComparison.Ordinal))
+            {
+                find = strippedFind;
+                replace = StripLineNumbers(replace);
+                first = content.IndexOf(find, StringComparison.Ordinal);
+            }
+            else
+            {
+                return "Error: 'find' text not found in the file. Read the file again and copy the snippet exactly, including whitespace and without line-number prefixes.";
+            }
         }
         if (content.IndexOf(find, first + 1, StringComparison.Ordinal) >= 0)
         {
@@ -335,6 +469,21 @@ class AgentTools
             : $"[truncated, showing last {_maxResultChars:N0} of {text.Length:N0} characters]\n" + text[^_maxResultChars..];
 
     private static int CountLines(string text) => text.Split('\n').Length;
+
+    // Removes read_file's "  12: " prefixes from every line of a snippet.
+    private static string StripLineNumbers(string text) =>
+        Regex.Replace(text, @"^\s*\d+: ", "", RegexOptions.Multiline);
+
+    private static int? GetInt(JsonElement args, string name) =>
+        args.ValueKind == JsonValueKind.Object && args.TryGetProperty(name, out var value)
+            ? value.ValueKind switch
+            {
+                JsonValueKind.Number when value.TryGetInt32(out var n) => n,
+                // Models sometimes send numbers as strings.
+                JsonValueKind.String when int.TryParse(value.GetString(), out var n) => n,
+                _ => null
+            }
+            : null;
 
     private static string? GetString(JsonElement args, string name) =>
         args.ValueKind == JsonValueKind.Object

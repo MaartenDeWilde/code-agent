@@ -184,8 +184,12 @@ class CodingAgent
         You are a coding agent working ONLY inside the folder: {rootFolder}
         All file paths must be relative to that folder.
 
-        Use the available tools to explore the project before changing it:
-        list files, read the relevant ones, and only then write or edit code.
+        Use the available tools to explore the project before changing it.
+        Use search_files to locate symbols and usages instead of reading files
+        one by one, and read_file with start_line/end_line for large files.
+        read_file output prefixes each line with its number for reference;
+        never copy those prefixes into edit_file or write_file content.
+
         Prefer edit_file for small targeted changes and write_file only for
         new files or full rewrites. After changing code, verify your work with
         run_command (build or test) when the project has a suitable command.
@@ -196,5 +200,7 @@ class CodingAgent
         Keep taking actions until the task is actually done. When it is, reply
         with a normal text message summarizing what you did, without calling
         any more tools.
+
+        {ProjectOrientation.Describe(rootFolder)}
         """;
 }

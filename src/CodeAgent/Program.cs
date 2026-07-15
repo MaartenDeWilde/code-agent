@@ -8,11 +8,11 @@ static void DisplayLogo()
     Console.ResetColor();
 }
 
-DisplayLogo();
-Console.WriteLine();
-
 // Clear terminal screen on startup
 Console.Clear();
+
+DisplayLogo();
+Console.WriteLine();
 
 // --- 1. Ask for the folder the agent is allowed to work in ---
 string rootFolder;

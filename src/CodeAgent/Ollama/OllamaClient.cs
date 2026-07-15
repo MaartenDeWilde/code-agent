@@ -26,6 +26,12 @@ class ChatMessage
     [JsonPropertyName("tool_name")]
     public string? ToolName { get; set; }
 
+    // Streamed by thinking models (gpt-oss, ...): reasoning tokens that are
+    // not part of the reply. Never echoed back; only used to signal that the
+    // model is still working while nothing visible is being produced.
+    [JsonPropertyName("thinking")]
+    public string? Thinking { get; set; }
+
     // Local bookkeeping, never sent to the model: the main argument of the
     // call that produced this result (file path, search pattern, command).
     // Lets ConversationHistory say WHAT was removed, so the model knows which
@@ -102,7 +108,10 @@ class OllamaClient
     /// <summary>
     /// Sends the conversation to the model and streams the reply.
     /// Text tokens are passed to <paramref name="onToken"/> as they arrive;
-    /// tool calls are collected and returned once the stream completes.
+    /// <paramref name="onThinking"/> fires for reasoning tokens of thinking
+    /// models, whose text is deliberately not exposed — only the fact that
+    /// the model is still generating. Tool calls are collected and returned
+    /// once the stream completes.
     /// </summary>
     public async Task<ChatResponse> ChatAsync(
         string model,
@@ -110,6 +119,7 @@ class OllamaClient
         object[] tools,
         int contextTokens,
         Action<string> onToken,
+        Action? onThinking = null,
         CancellationToken cancellationToken = default)
     {
         var request = new
@@ -175,6 +185,11 @@ class OllamaClient
             if (message is null)
             {
                 continue;
+            }
+
+            if (!string.IsNullOrEmpty(message.Thinking))
+            {
+                onThinking?.Invoke();
             }
 
             if (!string.IsNullOrEmpty(message.Content))

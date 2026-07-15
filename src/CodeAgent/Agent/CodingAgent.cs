@@ -158,10 +158,14 @@ class CodingAgent
             // measure the real chars-per-token ratio.
             var charsSent = _history.TotalChars;
             var spinner = Spinner.Start();
+            // Whether streamed text left the cursor mid-line, so the spinner
+            // (which redraws its own line with '\r') doesn't overwrite it.
+            var midLine = false;
             try
             {
-                // Stream tokens straight to the console; the spinner is only
-                // visible until the first token arrives.
+                // Stream tokens straight to the console; the spinner is
+                // visible until the first token arrives, and again whenever
+                // the model goes quiet to think.
                 response = await _ollama.ChatAsync(Model, _history.Messages, tools, _contextTokens,
                     onToken: text =>
                     {
@@ -169,6 +173,23 @@ class CodingAgent
                         // The model's own words stand out from tool chatter.
                         Console.ForegroundColor = ConsoleColor.Green;
                         Console.Write(text);
+                        midLine = !text.EndsWith('\n');
+                    },
+                    onThinking: () =>
+                    {
+                        // Thinking models generate reasoning tokens that are
+                        // not displayed; without the spinner the agent looks
+                        // frozen for however long the model deliberates.
+                        if (spinner.Stopped)
+                        {
+                            if (midLine)
+                            {
+                                Console.ResetColor();
+                                Console.WriteLine();
+                                midLine = false;
+                            }
+                            spinner = Spinner.Start();
+                        }
                     },
                     cancellationToken);
             }
@@ -234,8 +255,8 @@ class CodingAgent
                 }
             }
 
-            // Finish the streamed line before printing tool output.
-            if (response.Content.Length > 0)
+            // Finish the streamed line before printing anything else.
+            if (midLine)
             {
                 Console.WriteLine();
             }

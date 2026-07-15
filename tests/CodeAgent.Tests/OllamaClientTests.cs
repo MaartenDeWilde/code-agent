@@ -53,6 +53,27 @@ public class OllamaClientTests
     }
 
     [Fact]
+    public async Task ChatAsync_ThinkingChunks_SignalActivityWithoutPollutingContent()
+    {
+        // Thinking models (gpt-oss, ...) stream reasoning in a separate
+        // field; it must surface as activity, never as reply text.
+        var client = ClientServing(
+            """{"message":{"role":"assistant","thinking":"let me check"},"done":false}""",
+            """{"message":{"role":"assistant","thinking":" the file"},"done":false}""",
+            """{"message":{"role":"assistant","content":"answer"},"done":false}""",
+            """{"message":{"role":"assistant","content":""},"done":true}""");
+
+        var thinkingSignals = 0;
+        var response = await client.ChatAsync("m", AnyHistory, tools: [], contextTokens: 8192,
+            onToken: _ => { },
+            onThinking: () => thinkingSignals++);
+
+        Assert.Equal(2, thinkingSignals);
+        Assert.Equal("answer", response.Content);
+        Assert.DoesNotContain("let me check", response.Content);
+    }
+
+    [Fact]
     public async Task ChatAsync_ErrorChunk_ThrowsOllamaStreamException()
     {
         // The failure seen live: Ollama's tool-call parser dying mid-stream.

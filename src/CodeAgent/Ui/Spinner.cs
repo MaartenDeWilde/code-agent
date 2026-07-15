@@ -15,6 +15,12 @@ class Spinner
 
     public static Spinner Start() => new();
 
+    /// <summary>
+    /// Whether this spinner has been stopped. A spinner is single-use;
+    /// callers that want the animation back start a new one.
+    /// </summary>
+    public bool Stopped => Volatile.Read(ref _stopped) == 1;
+
     public void Stop()
     {
         // Interlocked makes Stop idempotent even when called from both the

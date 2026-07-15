@@ -104,7 +104,7 @@ public class OllamaIntegrationTests
             contextTokens: 8192,
             // Cancel as soon as generation has demonstrably started.
             onToken: _ => cts.Cancel(),
-            cts.Token);
+            cancellationToken: cts.Token);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
     }

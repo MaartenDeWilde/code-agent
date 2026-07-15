@@ -4,7 +4,7 @@ using CodeAgent.Ollama;
 static void DisplayLogo()
 {
     Console.ForegroundColor = ConsoleColor.Blue;
-    Console.WriteLine("Mantares Coding Agent");
+    Console.WriteLine("C# Coding Agent");
     Console.ResetColor();
 }
 

@@ -76,9 +76,43 @@ class CodingAgent
         }
     }
 
-    // How often a reply Ollama failed to parse (malformed tool-call syntax)
-    // is retried before the task is abandoned.
+    // How often a malformed reply (unparseable tool-call syntax, leaked
+    // template markup, empty) is retried before the task is abandoned.
+    // Consecutive failures only; any good reply resets the count.
     private const int MaxStreamRetries = 3;
+
+    // The corrective note injected before resampling a malformed reply. One
+    // constant for every failure shape, so old copies can be removed by
+    // exact match when a fresh one is added.
+    private const string MalformedReplyNote =
+        "[Your previous reply was discarded because it was malformed (bad tool-call syntax, raw template markup, or empty). "
+        + "Reply again: call a tool using the native tool-calling format, or give your final answer as plain text.]";
+
+    // Chat-template control tokens that belong to the wire format, never in
+    // reply text: Harmony (gpt-oss) and ChatML (qwen, ...). Ollama's parser
+    // can eat part of the token before giving up, so degraded variants like
+    // '<channel|>' leak too — accept any bracketed form that still has at
+    // least one pipe, while a pipe-less '<end>' stays valid in ordinary text.
+    private const string ControlTokenNames = "channel|message|start|end|return|call|im_start|im_end";
+    private static readonly System.Text.RegularExpressions.Regex LeakedControlToken = new(
+        $@"<\|({ControlTokenNames})\|?>|<({ControlTokenNames})\|>",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Tool-call syntax written out as text instead of using native tool
+    // calling — another way a reply can look like an answer but mean a call.
+    private static readonly string[] FakedToolCallMarkers =
+        { "<tool_call>", "</tool_call>", "<function_call>", "[TOOL_CALLS]" };
+
+    // When either kind of markup leaks through, Ollama failed to parse what
+    // the model meant (usually a tool call), and treating the reply as a
+    // final answer would strand the task mid-way.
+    internal static string? FindLeakedTemplateMarker(string content)
+    {
+        var control = LeakedControlToken.Match(content);
+        return control.Success
+            ? control.Value
+            : FakedToolCallMarkers.FirstOrDefault(marker => content.Contains(marker, StringComparison.Ordinal));
+    }
 
     // Every this many steps the original task and the progress so far are
     // re-injected into the transcript. Long multi-file tasks push the task
@@ -158,9 +192,8 @@ class CodingAgent
                 Console.WriteLine($"[Ollama rejected the model's reply ({ex.Message}); retrying {streamRetries}/{MaxStreamRetries}]");
                 Console.ResetColor();
                 // One corrective note is enough; drop copies from earlier retries.
-                const string retryNote = "[Your previous reply was discarded because its tool-call syntax could not be parsed. Reply again, with correctly formatted tool calls.]";
-                _history.RemoveUserMessages(content => content == retryNote);
-                _history.AddUser(retryNote);
+                _history.RemoveUserMessages(content => content == MalformedReplyNote);
+                _history.AddUser(MalformedReplyNote);
                 continue;
             }
             // Ctrl+C. The 'when' filter distinguishes a user interrupt from
@@ -185,10 +218,6 @@ class CodingAgent
             spinner.Stop();
             Console.ResetColor();
 
-            // Only consecutive parse failures should abandon the task; a
-            // successful reply proves the model can still produce valid output.
-            streamRetries = 0;
-
             _lastStats = response.Stats ?? _lastStats;
 
             // Recalibrate the trimming budget from the real token count. The
@@ -211,15 +240,44 @@ class CodingAgent
                 Console.WriteLine();
             }
 
+            // A reply with no tool calls should be the final answer — but not
+            // when it leaked template markup (a tool call Ollama failed to
+            // parse) or came back empty. Accepting those would strand the
+            // task mid-way; discard the reply and resample instead, exactly
+            // like a reply Ollama itself rejected.
+            if (response.ToolCalls.Count == 0)
+            {
+                var problem = response.Content.Trim().Length == 0
+                    ? "the reply was empty"
+                    : FindLeakedTemplateMarker(response.Content) is { } marker
+                        ? $"the reply leaked the template marker '{marker}' instead of making a proper tool call"
+                        : null;
+                if (problem is not null)
+                {
+                    if (++streamRetries > MaxStreamRetries)
+                    {
+                        Console.WriteLine($"[giving up after {MaxStreamRetries} retries — the model keeps producing malformed replies]");
+                        return;
+                    }
+
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[{problem}; retrying {streamRetries}/{MaxStreamRetries}]");
+                    Console.ResetColor();
+                    _history.RemoveUserMessages(content => content == MalformedReplyNote);
+                    _history.AddUser(MalformedReplyNote);
+                    continue;
+                }
+            }
+
+            // Only consecutive malformed replies should abandon the task; a
+            // good reply proves the model can still produce valid output.
+            streamRetries = 0;
+
             _history.AddAssistant(response.Content, response.ToolCalls);
 
             // No tool calls means the streamed text was the final answer.
             if (response.ToolCalls.Count == 0)
             {
-                if (response.Content.Length == 0)
-                {
-                    Console.WriteLine("(no answer given)");
-                }
                 if (planMode)
                 {
                     Console.ForegroundColor = ConsoleColor.DarkGray;

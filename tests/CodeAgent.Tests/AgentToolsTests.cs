@@ -271,6 +271,22 @@ public class AgentToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task EditFile_RelaxedMatchInCrlfFile_KeepsLineEndings()
+    {
+        CreateFile("a.cs", "if (x)\r\n{\r\n    var y = 2;\r\n    return y;\r\n}\r\n");
+
+        // Unindented 'find' forces the relaxed match; the inserted lines must
+        // come out CRLF like the rest of the file, not LF.
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "a.cs", find = "var y = 2;\nreturn y;", replace = "var y = 3;\nreturn y;" }));
+
+        Assert.StartsWith("Replaced", result);
+        var updated = File.ReadAllText(Path.Combine(_root, "a.cs"));
+        Assert.Contains("    var y = 3;\r\n    return y;\r\n", updated);
+        Assert.DoesNotContain("\n    var y = 3;\n", updated); // no bare-LF line snuck in
+    }
+
+    [Fact]
     public async Task EditFile_AmbiguousIgnoringIndentation_ReturnsError()
     {
         // Two regions with identical code at different depths: even the
@@ -423,6 +439,22 @@ public class AgentToolsTests : IDisposable
 
         Assert.Contains("hi", first);
         Assert.Contains("bye", second);
+    }
+
+    [Fact]
+    public async Task RunCommand_ShellOperators_SessionApprovalDoesNotApply()
+    {
+        UserTypes("a\n"); // approve the 'echo' program for the session
+        var plain = await _tools.ExecuteAsync("run_command", Args(new { command = "echo hi" }));
+
+        // Under 'sh -c' a chained command could smuggle anything behind the
+        // approved program name; it must prompt again. No input is queued,
+        // so the prompt reads null and declines.
+        var chained = await _tools.ExecuteAsync("run_command",
+            Args(new { command = "echo hi && echo chained" }));
+
+        Assert.Contains("hi", plain);
+        Assert.Contains("declined", chained);
     }
 
     [Fact]

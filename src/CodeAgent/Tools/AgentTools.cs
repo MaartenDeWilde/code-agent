@@ -460,34 +460,49 @@ class AgentTools
         }
 
         var matchLine = matches[0];
+        var fileIndent = LeadingWhitespace(fileLines[matchLine]);
+        var findIndent = LeadingWhitespace(findLines[0]);
         var replaceLines = replace.Trim().Length == 0
             ? Array.Empty<string>() // an empty replacement deletes the lines
-            : Reindent(replace, fileLines[matchLine], findLines[0]);
+            : Reindent(replace, fileIndent, findIndent);
+
+        // Splitting a CRLF file on '\n' leaves the '\r' on every kept line;
+        // inserted lines need it too, or the file ends up with mixed endings.
+        if (content.Contains("\r\n"))
+        {
+            replaceLines = replaceLines
+                .Select(line => line.EndsWith('\r') ? line : line + "\r")
+                .ToArray();
+        }
+
         var updated = string.Join('\n',
             fileLines[..matchLine].Concat(replaceLines).Concat(fileLines[(matchLine + trimmedFind.Length)..]));
         File.WriteAllText(fullPath, updated);
 
-        return $"Replaced {trimmedFind.Length} lines in {relativePath}. Note: your 'find' had different "
-            + "indentation than the file; it was matched ignoring indentation and the replacement was re-indented.\n"
+        // Tell the model what was corrected, and only what was corrected —
+        // a claim of re-indentation when only a stray space differed would
+        // teach it the wrong lesson.
+        var note = fileIndent == findIndent
+            ? "your 'find' did not match the file exactly (stray whitespace?); it was matched with whitespace relaxed"
+            : "your 'find' had different indentation than the file; the replacement was re-indented to match";
+        return $"Replaced {trimmedFind.Length} lines in {relativePath} ({note}).\n"
             + SnippetAround(updated, matchLine + 1, Math.Max(replaceLines.Length, 1));
     }
 
+    private static string LeadingWhitespace(string line) => line[..(line.Length - line.TrimStart().Length)];
+
     // Adjusts a replacement written against the model's (wrong) indentation
     // to the file's real one: the leading whitespace the 'find' snippet used
-    // is swapped for the whitespace of the line that actually matched.
-    private static string[] Reindent(string replace, string matchedLine, string findLine)
+    // is swapped for the whitespace of the line that actually matched. Only
+    // lines that share the snippet's base indentation are shifted; anything
+    // else is left alone rather than guessed at.
+    private static string[] Reindent(string replace, string fileIndent, string findIndent)
     {
-        static string LeadingWhitespace(string line) => line[..(line.Length - line.TrimStart().Length)];
-
-        var fileIndent = LeadingWhitespace(matchedLine);
-        var findIndent = LeadingWhitespace(findLine);
         if (fileIndent == findIndent)
         {
             return replace.Split('\n');
         }
 
-        // Only lines that share the snippet's base indentation are shifted;
-        // anything else is left alone rather than guessed at.
         return replace.Split('\n')
             .Select(line => line.Trim().Length > 0 && line.StartsWith(findIndent, StringComparison.Ordinal)
                 ? fileIndent + line[findIndent.Length..]
@@ -539,7 +554,20 @@ class AgentTools
         // 'dotnet test' — exact-string approval made iterative build/fix
         // loops prompt on every variation.
         var program = command.TrimStart().Split(' ', 2)[0];
-        if (!_approvedCommandPrograms.Contains(program))
+        if (ContainsShellOperators(command))
+        {
+            // The command runs under 'sh -c', where ';', '&&', '|', '$()' and
+            // redirects can chain an innocent-looking program into anything.
+            // Program-level session approval must not cover those, so they
+            // are confirmed individually, every time.
+            Console.WriteLine();
+            Console.WriteLine($"The agent wants to run: {command}");
+            if (!ConfirmOnce("Allow? (uses shell operators, so session approvals do not apply)"))
+            {
+                return "User declined to run the command.";
+            }
+        }
+        else if (!_approvedCommandPrograms.Contains(program))
         {
             Console.WriteLine();
             Console.WriteLine($"The agent wants to run: {command}");
@@ -695,7 +723,24 @@ class AgentTools
         }
     }
 
+    // Characters that let a command chain, substitute or redirect under
+    // 'sh -c'. Plain '$VAR' expansion is allowed; '$(' command substitution
+    // is not.
+    private static bool ContainsShellOperators(string command) =>
+        command.IndexOfAny(new[] { ';', '&', '|', '>', '<', '`', '\n' }) >= 0
+        || command.Contains("$(");
+
     private enum ConfirmResult { No, Yes, Always }
+
+    // A yes/no confirmation without the session-wide 'always' option, for
+    // actions where a blanket approval would be unsafe.
+    private static bool ConfirmOnce(string question)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.Write($"{question} [y]es / [N]o ");
+        Console.ResetColor();
+        return Console.ReadLine()?.Trim().ToLowerInvariant() is "y" or "yes";
+    }
 
     // Asks the user to confirm a destructive action. 'a' grants a
     // session-scoped approval; alwaysDescription spells out exactly what

@@ -25,6 +25,14 @@ class CodingAgent
     // accurate than any estimate we can make from character counts.
     private ChatStats? _lastStats;
 
+    // Lowest chars-per-token ratio observed this session; starts at the ~4
+    // the initial budget assumes. Only ever ratcheted DOWN: Ollama's
+    // prompt_eval_count excludes tokens served from its session cache, so a
+    // warm-cache request makes the ratio read absurdly high — only a
+    // cache-cold measurement (like the session's first request) can be
+    // trusted, and it can only ever tell us the budget is too generous.
+    private double _charsPerToken = 4.0;
+
     public CodingAgent(string rootFolder, string model, int contextTokens)
     {
         Model = model;
@@ -189,8 +197,12 @@ class CodingAgent
             // drop the oldest part of the prompt — usually the system prompt.
             if (response.Stats is { PromptTokens: > 0 } tokenStats && charsSent > 0)
             {
-                var charsPerToken = Math.Clamp((double)charsSent / tokenStats.PromptTokens, 2.0, 6.0);
-                _history.UpdateBudget((int)(_contextTokens * 0.8 * charsPerToken));
+                var observed = Math.Max((double)charsSent / tokenStats.PromptTokens, 2.0);
+                if (observed < _charsPerToken)
+                {
+                    _charsPerToken = observed;
+                    _history.UpdateBudget((int)(_contextTokens * 0.8 * _charsPerToken));
+                }
             }
 
             // Finish the streamed line before printing tool output.

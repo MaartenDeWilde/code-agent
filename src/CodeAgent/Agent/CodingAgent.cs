@@ -1,6 +1,9 @@
 using CodeAgent.Ollama;
 using CodeAgent.Tools;
 using CodeAgent.Ui;
+// The class is named like its namespace, so a plain 'using' would make the
+// bare name 'Guardrails' resolve to the namespace; import the members instead.
+using static CodeAgent.Guardrails.Guardrails;
 
 namespace CodeAgent.Agent;
 
@@ -33,15 +36,20 @@ class CodingAgent
     // trusted, and it can only ever tell us the budget is too generous.
     private double _charsPerToken = 4.0;
 
+    // The command that must succeed after file changes before a final answer
+    // is accepted; null when the project's stack isn't recognized.
+    private readonly string? _verifyCommand;
+
     public CodingAgent(string rootFolder, string model, int contextTokens)
     {
         Model = model;
         _contextTokens = contextTokens;
+        _verifyCommand = ProjectVerification.DetectCommand(rootFolder);
 
         // Trim the transcript at ~80% of the window (at ~4 chars per token),
         // keeping the rest free for the model's reply and tool schemas.
         var maxChars = (int)(contextTokens * 4L * 80 / 100);
-        _history = new ConversationHistory(BuildSystemPrompt(rootFolder), maxChars);
+        _history = new ConversationHistory(BuildSystemPrompt(rootFolder, _verifyCommand), maxChars);
 
         // Cap individual tool results relative to the budget so one huge file
         // or command output can't monopolize the window, while still letting
@@ -59,6 +67,14 @@ class CodingAgent
 
     public async Task RunAsync(string task, bool planMode = false, CancellationToken cancellationToken = default)
     {
+        if (!IsSafe(task))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Security Error: {GetErrorMessage()}]");
+            Console.ResetColor();
+            return;
+        }
+
         _history.AddUser(planMode ? WrapPlanTask(task) : task);
         var tools = planMode ? AgentTools.PlanDefinitions : AgentTools.Definitions;
         var activity = new TaskActivity();
@@ -128,9 +144,19 @@ class CodingAgent
     // previous recap, so only the latest one occupies context.
     private const string ProgressReminderHeader = "[Automated progress check — this is not a message from the user.]";
 
+    // How often an unverified final answer is sent back before it is
+    // accepted anyway (with a console warning). A hard block could ping-pong
+    // forever with a model that cannot get the build green or a user who
+    // keeps declining the command.
+    private const int MaxVerifyNudges = 2;
+
     private async Task RunLoopAsync(string task, object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
     {
         var streamRetries = 0;
+        // Set when a file is changed, cleared when the project's verification
+        // command succeeds — a final answer is only clean when this is false.
+        var unverifiedChanges = false;
+        var verifyNudges = 0;
         for (var step = 0; step < MaxSteps; step++)
         {
             activity.Turns++;
@@ -299,6 +325,25 @@ class CodingAgent
             // No tool calls means the streamed text was the final answer.
             if (response.ToolCalls.Count == 0)
             {
+                // Changed files whose build/tests haven't passed since are
+                // not a finished task; send the answer back with orders to
+                // verify first. (Plan mode cannot change files.)
+                if (unverifiedChanges && _verifyCommand is not null && verifyNudges < MaxVerifyNudges)
+                {
+                    verifyNudges++;
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[final answer rejected: files changed but '{_verifyCommand}' has not succeeded since — asking the model to verify ({verifyNudges}/{MaxVerifyNudges})]");
+                    Console.ResetColor();
+                    _history.AddUser($"[Automated check — files were changed but '{_verifyCommand}' has not succeeded since. "
+                        + "Run it with run_command now, fix any failures, and only then give your final answer.]");
+                    continue;
+                }
+                if (unverifiedChanges && _verifyCommand is not null)
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[warning: task ended without a successful '{_verifyCommand}' after file changes]");
+                    Console.ResetColor();
+                }
                 if (planMode)
                 {
                     Console.ForegroundColor = ConsoleColor.DarkGray;
@@ -335,6 +380,16 @@ class CodingAgent
                     activity.Record(name, call.Function.Arguments);
                 }
                 batchFailed |= IsToolFailure(result);
+
+                // Track whether the working tree is in a proven state: file
+                // changes taint it, a passing verification command clears it.
+                unverifiedChanges |= ChangesFiles(name, result);
+                if (name == "run_command" && IsSuccessfulVerification(
+                        _verifyCommand, AgentTools.GetString(call.Function.Arguments, "command") ?? "", result))
+                {
+                    unverifiedChanges = false;
+                }
+
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.WriteLine($"[{name}] {DescribeCall(name, call.Function.Arguments, result)}");
                 Console.ResetColor();
@@ -370,6 +425,27 @@ class CodingAgent
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine(line);
         Console.ResetColor();
+    }
+
+    // A successful write_file or edit_file leaves the code in an unproven
+    // state until the verification command passes again.
+    internal static bool ChangesFiles(string name, string result) =>
+        (name == "write_file" && result.StartsWith("Wrote", StringComparison.Ordinal))
+        || (name == "edit_file" && result.StartsWith("Replaced", StringComparison.Ordinal));
+
+    // Whether this run_command call counts as the project's verification
+    // passing. 'dotnet test' builds first, so it also satisfies a
+    // 'dotnet build' requirement — never the other way around.
+    internal static bool IsSuccessfulVerification(string? verifyCommand, string command, string result)
+    {
+        if (verifyCommand is null || !result.StartsWith("exit code: 0", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        command = command.TrimStart();
+        return command.StartsWith(verifyCommand, StringComparison.Ordinal)
+            || (verifyCommand == "dotnet build" && command.StartsWith("dotnet test", StringComparison.Ordinal));
     }
 
     // Whether a tool result means the call did not do its job. Failed shell
@@ -541,9 +617,16 @@ class CodingAgent
         Task: {task}
         """;
 
-    private static string BuildSystemPrompt(string rootFolder) => $"""
+    private static string BuildSystemPrompt(string rootFolder, string? verifyCommand) => $"""
         You are a coding agent working ONLY inside the folder: {rootFolder}
         All file paths must be relative to that folder.
+        {(verifyCommand is null ? "" : $"""
+
+        This project's verification command is '{verifyCommand}'. After you
+        change any file, you MUST run it with run_command and fix any
+        failures before giving your final answer. Never end a task with code
+        that does not compile.
+        """)}
 
         Use the available tools to explore the project before changing it.
         Use search_files to locate symbols and usages instead of reading files

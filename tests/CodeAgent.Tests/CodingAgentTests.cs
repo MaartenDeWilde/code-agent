@@ -40,6 +40,30 @@ public class CodingAgentTests
     }
 
     [Theory]
+    [InlineData("write_file", "Wrote 120 characters to a.cs", true)]
+    [InlineData("edit_file", "Replaced 10 characters with 12 characters in a.cs.", true)]
+    [InlineData("write_file", "No change: a.cs already has exactly this content.", false)]
+    [InlineData("edit_file", "Error: 'find' text not found in the file.", false)]
+    [InlineData("read_file", "    1: whatever", false)]
+    public void ChangesFiles_OnlyCountsSuccessfulWrites(string tool, string result, bool expected)
+    {
+        Assert.Equal(expected, CodingAgent.ChangesFiles(tool, result));
+    }
+
+    [Theory]
+    [InlineData("dotnet build", "dotnet build", "exit code: 0\nstdout:\nBuild succeeded.", true)]
+    [InlineData("dotnet build", "dotnet test", "exit code: 0\nstdout:\nPassed!", true)] // test implies build
+    [InlineData("dotnet test", "dotnet build", "exit code: 0\nstdout:\nBuild succeeded.", false)] // build alone can't stand in for tests
+    [InlineData("dotnet build", "dotnet build", "exit code: 1\nstderr:\nCS1002", false)] // failed run proves nothing
+    [InlineData("dotnet build", "echo skip the build", "exit code: 0", false)] // unrelated command
+    [InlineData(null, "dotnet build", "exit code: 0", false)] // unrecognized stack: nothing to satisfy
+    public void IsSuccessfulVerification_RequiresTheRightCommandToPass(
+        string? verifyCommand, string command, string result, bool expected)
+    {
+        Assert.Equal(expected, CodingAgent.IsSuccessfulVerification(verifyCommand, command, result));
+    }
+
+    [Theory]
     [InlineData("I'll read the file now<|channel|>")] // Harmony control token (gpt-oss)
     [InlineData("I'll read the file now<channel|>")] // same, leading pipe eaten by Ollama's partial parse
     [InlineData("some text<|channel>")] // trailing pipe eaten

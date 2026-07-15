@@ -120,7 +120,11 @@ class OllamaClient
             tools,
             // Ollama applies its own (often small) default context length per
             // request; ask explicitly for the window we plan around.
-            options = new { num_ctx = contextTokens }
+            // The sampling defaults are tuned for chat, not agent work:
+            // temperature ~0.8 is where tool-call drift and malformed JSON
+            // come from, and repeat_penalty 1.1 corrupts code, which repeats
+            // indentation and brackets by nature.
+            options = new { num_ctx = contextTokens, temperature = 0.2, repeat_penalty = 1.0 }
         };
 
         var body = JsonSerializer.Serialize(request, SerializerOpts);

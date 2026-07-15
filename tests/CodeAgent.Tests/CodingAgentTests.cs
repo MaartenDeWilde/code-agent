@@ -15,7 +15,7 @@ public class CodingAgentTests
         activity.Record("edit_file", Args(new { path = "src/App.cs" }));
         activity.Record("run_command", Args(new { command = "dotnet build" }));
 
-        var reminder = CodingAgent.BuildProgressReminder("add logging to all services", activity);
+        var reminder = CodingAgent.BuildProgressReminder("add logging to all services", activity, planMode: false);
 
         // The reminder must anchor the model back to the original task and
         // list what it already did, so it can work out what remains.
@@ -32,10 +32,24 @@ public class CodingAgentTests
         var activity = new CodingAgent.TaskActivity();
         activity.Record("read_file", Args(new { path = "a.cs" }));
 
-        var reminder = CodingAgent.BuildProgressReminder("task", activity);
+        var reminder = CodingAgent.BuildProgressReminder("task", activity, planMode: false);
 
         Assert.Contains("Files read so far: a.cs", reminder);
         Assert.DoesNotContain("Files edited so far", reminder);
         Assert.DoesNotContain("Commands run so far", reminder);
+    }
+
+    [Fact]
+    public void ProgressReminder_InPlanMode_AsksForAPlanNotASummary()
+    {
+        var activity = new CodingAgent.TaskActivity();
+        activity.Record("read_file", Args(new { path = "a.cs" }));
+
+        var reminder = CodingAgent.BuildProgressReminder("task", activity, planMode: true);
+
+        // Plan mode must end in a presented plan; the normal 'summarize what
+        // you did' closing would invite the model to skip the plan.
+        Assert.Contains("plan", reminder);
+        Assert.DoesNotContain("summary", reminder);
     }
 }

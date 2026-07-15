@@ -45,9 +45,11 @@ var modelInput = Console.ReadLine()?.Trim();
 var model = string.IsNullOrWhiteSpace(modelInput) ? "gemma4:12b-mlx" : modelInput;
 
 // --- 3. Context window: sent to Ollama as num_ctx and used for trimming ---
-Console.Write("Context window in tokens [262144]: ");
+// Small local models degrade (and their KV cache balloons) long before huge
+// windows; 32k plus transcript trimming beats a nominal 262k in practice.
+Console.Write("Context window in tokens [32768]: ");
 var contextInput = Console.ReadLine()?.Trim();
-var contextTokens = int.TryParse(contextInput, out var parsed) && parsed > 0 ? parsed : 262144;
+var contextTokens = int.TryParse(contextInput, out var parsed) && parsed > 0 ? parsed : 32768;
 
 Console.WriteLine();
 Console.WriteLine($"Working folder: {rootFolder}");

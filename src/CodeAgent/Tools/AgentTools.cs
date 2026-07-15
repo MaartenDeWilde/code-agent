@@ -35,10 +35,14 @@ class AgentTools
     private readonly int _maxResultChars;
 
     // Session-scoped approvals collected via the 'a' confirmation answer:
-    // full paths whose overwrites are pre-approved, and exact command
-    // strings that may run without asking again.
+    // full paths whose overwrites are pre-approved, and command programs
+    // (first token, e.g. 'dotnet') that may run without asking again.
     private readonly HashSet<string> _approvedOverwrites = new();
-    private readonly HashSet<string> _approvedCommands = new();
+    private readonly HashSet<string> _approvedCommandPrograms = new();
+
+    // How often a whole-file rewrite was rejected per path; after the first
+    // rejection the model gets the benefit of the doubt and the user decides.
+    private readonly Dictionary<string, int> _rewriteRejections = new();
 
     public AgentTools(string rootFolder, int maxResultChars)
     {
@@ -94,7 +98,8 @@ class AgentTools
             "Run a shell command inside the working folder and return its exit code and output. Use it to build, test or inspect the project. The user must approve each command.",
             new
             {
-                command = Param("string", "The shell command to run, e.g. 'dotnet build'")
+                command = Param("string", "The shell command to run, e.g. 'dotnet build'"),
+                timeout_seconds = Param("integer", "Optional timeout in seconds (default 120, max 600). Raise it for slow commands like package installs or full test runs.")
             }, "command"),
 
         ["ask_user"] = Tool("ask_user",
@@ -134,7 +139,8 @@ class AgentTools
                 "edit_file" => EditFile(GetString(args, "path") ?? "",
                                         GetString(args, "find") ?? "",
                                         GetString(args, "replace") ?? ""),
-                "run_command" => await RunCommandAsync(GetString(args, "command") ?? ""),
+                "run_command" => await RunCommandAsync(GetString(args, "command") ?? "",
+                                                       GetInt(args, "timeout_seconds")),
                 "ask_user" => AskUser(GetString(args, "question") ?? ""),
                 _ => $"Unknown tool '{name}'. Valid tools: {string.Join(", ", AllDefinitions.Keys)}."
             };
@@ -169,10 +175,22 @@ class AgentTools
 
     private string ListFiles(string pattern)
     {
-        var files = EnumerateSourceFiles(pattern).Take(200).ToList();
-        return files.Count == 0
-            ? "No files matched."
-            : string.Join("\n", files);
+        const int maxListed = 200;
+
+        // Take one extra so a truncated listing is distinguishable from one
+        // that happens to be exactly at the cap.
+        var files = EnumerateSourceFiles(pattern).Take(maxListed + 1).ToList();
+        if (files.Count == 0)
+        {
+            return "No files matched.";
+        }
+
+        // Without this marker the model may conclude an unlisted file doesn't
+        // exist and create a duplicate of it.
+        return files.Count <= maxListed
+            ? string.Join("\n", files)
+            : string.Join("\n", files.Take(maxListed))
+              + $"\n[stopped after {maxListed} files — narrow the pattern to see the rest]";
     }
 
     private string ReadFile(string relativePath, int? startLine, int? endLine)
@@ -303,9 +321,18 @@ class AgentTools
             }
             if (IsMostlyUnchanged(existing, content))
             {
-                return "Error: most of this content is already in the existing file. Do not rewrite " +
-                       "the whole file; use edit_file with an exact 'find' snippet and 'replace' text " +
-                       "for just the part you want to change.";
+                // Redirect to edit_file once. If the model keeps insisting —
+                // a legitimate large refactor (reordering methods, say) also
+                // looks 'mostly unchanged' — stop blocking and let the user
+                // decide via the confirmation below instead of dead-ending.
+                var rejections = _rewriteRejections.GetValueOrDefault(fullPath) + 1;
+                _rewriteRejections[fullPath] = rejections;
+                if (rejections < 2)
+                {
+                    return "Error: most of this content is already in the existing file. Do not rewrite " +
+                           "the whole file; use edit_file with an exact 'find' snippet and 'replace' text " +
+                           "for just the part you want to change.";
+                }
             }
 
             if (!_approvedOverwrites.Contains(fullPath))
@@ -364,7 +391,11 @@ class AgentTools
             }
             else
             {
-                return "Error: 'find' text not found in the file. Read the file again and copy the snippet exactly, including whitespace and without line-number prefixes.";
+                // Last resort: the snippet is often right except for its
+                // indentation (tabs vs spaces, a re-wrapped copy). Try a
+                // line-by-line match with whitespace trimmed.
+                return EditIgnoringIndentation(fullPath, relativePath, content,
+                    StripLineNumbers(find), StripLineNumbers(replace));
             }
         }
         if (content.IndexOf(find, first + 1, StringComparison.Ordinal) >= 0)
@@ -382,6 +413,86 @@ class AgentTools
         var firstChangedLine = CountLines(content[..first]);
         return $"Replaced {find.Length} characters with {replace.Length} characters in {relativePath}.\n"
             + SnippetAround(updated, firstChangedLine, CountLines(replace));
+    }
+
+    // Fallback for the most common small-model mistake in edit_file: the
+    // 'find' lines are right but their indentation is not. Matches the file
+    // line by line with surrounding whitespace ignored; the match must still
+    // be unique, and the replacement is re-indented to what the file really
+    // uses so the fix doesn't introduce misaligned code.
+    private string EditIgnoringIndentation(string fullPath, string relativePath, string content, string find, string replace)
+    {
+        var fileLines = content.Split('\n');
+        var findLines = find.Split('\n');
+
+        // Blank edge lines the model tends to add around a snippet carry no
+        // information and would prevent a match at the file's borders.
+        var start = Array.FindIndex(findLines, line => line.Trim().Length > 0);
+        var end = Array.FindLastIndex(findLines, line => line.Trim().Length > 0);
+        if (start < 0)
+        {
+            return "Error: 'find' must contain at least one non-blank line.";
+        }
+        findLines = findLines[start..(end + 1)];
+        var trimmedFind = findLines.Select(line => line.Trim()).ToArray();
+
+        var matches = new List<int>();
+        for (var i = 0; i + trimmedFind.Length <= fileLines.Length; i++)
+        {
+            var equal = true;
+            for (var j = 0; j < trimmedFind.Length && equal; j++)
+            {
+                equal = fileLines[i + j].Trim() == trimmedFind[j];
+            }
+            if (equal)
+            {
+                matches.Add(i);
+            }
+        }
+
+        if (matches.Count == 0)
+        {
+            return "Error: 'find' text not found in the file. Read the file again and copy the snippet exactly, including whitespace and without line-number prefixes.";
+        }
+        if (matches.Count > 1)
+        {
+            return "Error: 'find' text appears more than once (even ignoring indentation). Include more surrounding context to make it unique.";
+        }
+
+        var matchLine = matches[0];
+        var replaceLines = replace.Trim().Length == 0
+            ? Array.Empty<string>() // an empty replacement deletes the lines
+            : Reindent(replace, fileLines[matchLine], findLines[0]);
+        var updated = string.Join('\n',
+            fileLines[..matchLine].Concat(replaceLines).Concat(fileLines[(matchLine + trimmedFind.Length)..]));
+        File.WriteAllText(fullPath, updated);
+
+        return $"Replaced {trimmedFind.Length} lines in {relativePath}. Note: your 'find' had different "
+            + "indentation than the file; it was matched ignoring indentation and the replacement was re-indented.\n"
+            + SnippetAround(updated, matchLine + 1, Math.Max(replaceLines.Length, 1));
+    }
+
+    // Adjusts a replacement written against the model's (wrong) indentation
+    // to the file's real one: the leading whitespace the 'find' snippet used
+    // is swapped for the whitespace of the line that actually matched.
+    private static string[] Reindent(string replace, string matchedLine, string findLine)
+    {
+        static string LeadingWhitespace(string line) => line[..(line.Length - line.TrimStart().Length)];
+
+        var fileIndent = LeadingWhitespace(matchedLine);
+        var findIndent = LeadingWhitespace(findLine);
+        if (fileIndent == findIndent)
+        {
+            return replace.Split('\n');
+        }
+
+        // Only lines that share the snippet's base indentation are shifted;
+        // anything else is left alone rather than guessed at.
+        return replace.Split('\n')
+            .Select(line => line.Trim().Length > 0 && line.StartsWith(findIndent, StringComparison.Ordinal)
+                ? fileIndent + line[findIndent.Length..]
+                : line)
+            .ToArray();
     }
 
     // The lines spanned by an edit plus a little context, in read_file's
@@ -415,7 +526,7 @@ class AgentTools
         return snippet.ToString().TrimEnd();
     }
 
-    private async Task<string> RunCommandAsync(string command)
+    private async Task<string> RunCommandAsync(string command, int? timeoutSeconds)
     {
         if (string.IsNullOrWhiteSpace(command))
         {
@@ -423,18 +534,21 @@ class AgentTools
         }
 
         // Shell access is the most dangerous tool; every command needs an
-        // explicit go-ahead from the user, unless this exact command was
-        // already session-approved with 'a' (useful for build/test loops).
-        if (!_approvedCommands.Contains(command))
+        // explicit go-ahead from the user. 'a' approves the command's program
+        // (first token) for the session, so 'dotnet build' also covers
+        // 'dotnet test' — exact-string approval made iterative build/fix
+        // loops prompt on every variation.
+        var program = command.TrimStart().Split(' ', 2)[0];
+        if (!_approvedCommandPrograms.Contains(program))
         {
             Console.WriteLine();
             Console.WriteLine($"The agent wants to run: {command}");
-            switch (Confirm("Allow?"))
+            switch (Confirm("Allow?", $"allow '{program}' commands this session"))
             {
                 case ConfirmResult.No:
                     return "User declined to run the command.";
                 case ConfirmResult.Always:
-                    _approvedCommands.Add(command);
+                    _approvedCommandPrograms.Add(program);
                     break;
             }
         }
@@ -466,7 +580,10 @@ class AgentTools
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        // The model can raise the default for slow commands (installs, full
+        // test runs), within a hard cap so a typo can't stall the agent.
+        var seconds = Math.Clamp(timeoutSeconds ?? 120, 1, 600);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
         try
         {
             await process.WaitForExitAsync(timeout.Token);
@@ -474,7 +591,7 @@ class AgentTools
         catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
-            return "Error: command timed out after 2 minutes.";
+            return $"Error: command timed out after {seconds} seconds. Pass a larger timeout_seconds if it legitimately needs longer.";
         }
 
         var stdout = await stdoutTask;
@@ -580,13 +697,13 @@ class AgentTools
 
     private enum ConfirmResult { No, Yes, Always }
 
-    // Asks the user to confirm a destructive action. 'a' approves this
-    // overwrite target / exact command for the rest of the session, so
-    // iterative work doesn't prompt on every step.
-    private static ConfirmResult Confirm(string question)
+    // Asks the user to confirm a destructive action. 'a' grants a
+    // session-scoped approval; alwaysDescription spells out exactly what
+    // would be approved (an overwrite target, a command program).
+    private static ConfirmResult Confirm(string question, string alwaysDescription = "this session")
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.Write($"{question} [y]es / [a]lways this session / [N]o ");
+        Console.Write($"{question} [y]es / [a]lways {alwaysDescription} / [N]o ");
         Console.ResetColor();
         return Console.ReadLine()?.Trim().ToLowerInvariant() switch
         {

@@ -161,6 +161,26 @@ public class AgentToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteFile_SecondRewriteAttempt_AsksUserInsteadOfDeadEnding()
+    {
+        // A legitimate large refactor (reordered methods) also looks 'mostly
+        // unchanged'; after one redirect to edit_file the user decides.
+        var original = ManyLines("alpha", 20);
+        CreateFile("a.cs", original);
+        var oneLineChanged = original.Replace("alpha line number 7;", "alpha line number seven;");
+
+        var first = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = oneLineChanged }));
+        UserTypes("y\n");
+        var second = await _tools.ExecuteAsync("write_file",
+            Args(new { path = "a.cs", content = oneLineChanged }));
+
+        Assert.Contains("edit_file", first);
+        Assert.StartsWith("Wrote", second);
+        Assert.Contains("seven", File.ReadAllText(Path.Combine(_root, "a.cs")));
+    }
+
+    [Fact]
     public async Task WriteFile_SubstantiallyDifferentContent_StillAsksAndOverwrites()
     {
         CreateFile("a.cs", ManyLines("alpha", 20));
@@ -232,6 +252,36 @@ public class AgentToolsTests : IDisposable
         Assert.StartsWith("Replaced", result);
         Assert.Contains("not shown", result);
         Assert.DoesNotContain("beta line number 60;", result);
+    }
+
+    [Fact]
+    public async Task EditFile_MatchesDespiteDifferentIndentation()
+    {
+        CreateFile("a.cs", "if (x)\n{\n    var y = 2;\n    return y;\n}\n");
+
+        // The model reproduced the lines correctly but without indentation —
+        // the classic small-model copy mistake.
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "a.cs", find = "var y = 2;\nreturn y;", replace = "var y = 3;\nreturn y;" }));
+
+        Assert.StartsWith("Replaced", result);
+        Assert.Contains("re-indented", result); // the model is told what happened
+        // The replacement picked up the file's real indentation.
+        Assert.Contains("    var y = 3;\n    return y;", File.ReadAllText(Path.Combine(_root, "a.cs")));
+    }
+
+    [Fact]
+    public async Task EditFile_AmbiguousIgnoringIndentation_ReturnsError()
+    {
+        // Two regions with identical code at different depths: even the
+        // relaxed match must refuse to guess between them.
+        CreateFile("a.cs", "one\n    do();\n    end\ntwo\n        do();\n        end\n");
+
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "a.cs", find = "do();\nend", replace = "done();" }));
+
+        Assert.Contains("more than once", result);
+        Assert.Contains("do();", File.ReadAllText(Path.Combine(_root, "a.cs"))); // untouched
     }
 
     [Fact]
@@ -360,6 +410,30 @@ public class AgentToolsTests : IDisposable
 
         Assert.Contains("exit code: 0", first);
         Assert.Contains("exit code: 0", second);
+    }
+
+    [Fact]
+    public async Task RunCommand_AlwaysApproval_CoversOtherCommandsOfSameProgram()
+    {
+        UserTypes("a\n"); // approve the 'echo' program for the session
+
+        var first = await _tools.ExecuteAsync("run_command", Args(new { command = "echo hi" }));
+        // No input queued: a prompt for the second command would decline.
+        var second = await _tools.ExecuteAsync("run_command", Args(new { command = "echo bye" }));
+
+        Assert.Contains("hi", first);
+        Assert.Contains("bye", second);
+    }
+
+    [Fact]
+    public async Task RunCommand_TimeoutSecondsParameter_LimitsRuntime()
+    {
+        UserTypes("y\n");
+
+        var result = await _tools.ExecuteAsync("run_command",
+            Args(new { command = "sleep 30", timeout_seconds = 1 }));
+
+        Assert.Contains("timed out after 1 second", result);
     }
 
     [Fact]

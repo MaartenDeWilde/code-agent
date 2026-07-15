@@ -31,7 +31,7 @@ class ConversationHistory
     public IReadOnlyList<ChatMessage> Messages => _messages;
 
     /// <summary>Character budget the transcript is trimmed down to.</summary>
-    public int MaxChars { get; }
+    public int MaxChars { get; private set; }
 
     /// <summary>Current transcript size in characters, as sent to the model.</summary>
     public int TotalChars => _messages.Sum(SizeOf);
@@ -63,6 +63,27 @@ class ConversationHistory
         _messages.Add(message);
         TrimToBudget();
     }
+
+    /// <summary>
+    /// Replaces the character budget — used to recalibrate from the real
+    /// token counts Ollama reports, since the chars-per-token guess the
+    /// initial budget is built on overshoots for code-heavy text — and trims
+    /// immediately when the new budget is smaller.
+    /// </summary>
+    public void UpdateBudget(int maxChars)
+    {
+        // Never trim the transcript into uselessness, whatever the estimate says.
+        MaxChars = Math.Max(maxChars, 4_000);
+        TrimToBudget();
+    }
+
+    /// <summary>
+    /// Deletes user messages matching <paramref name="match"/>. Used to drop
+    /// outdated automated notes (progress reminders, retry notices) before a
+    /// fresh one is injected, so they don't pile up in the transcript.
+    /// </summary>
+    public void RemoveUserMessages(Func<string, bool> match) =>
+        _messages.RemoveAll(m => m.Role == "user" && match(m.Content));
 
     private void TrimToBudget()
     {

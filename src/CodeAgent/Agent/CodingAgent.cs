@@ -78,6 +78,14 @@ class CodingAgent
     // or forget what remains; a periodic recap anchors them again.
     private const int ProgressReminderInterval = 8;
 
+    // Every this many steps the user is asked whether the task should keep
+    // going, so a runaway task doesn't burn all of MaxSteps unattended.
+    private const int StepCheckInterval = 30;
+
+    // First line of the injected recap; also used to find and remove the
+    // previous recap, so only the latest one occupies context.
+    private const string ProgressReminderHeader = "[Automated progress check — this is not a message from the user.]";
+
     private async Task RunLoopAsync(string task, object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
     {
         var streamRetries = 0;
@@ -86,9 +94,11 @@ class CodingAgent
             activity.Turns++;
             if (step > 0 && step % ProgressReminderInterval == 0)
             {
-                _history.AddUser(BuildProgressReminder(task, activity));
+                // Only the latest recap is worth keeping; drop the previous one.
+                _history.RemoveUserMessages(content => content.StartsWith(ProgressReminderHeader, StringComparison.Ordinal));
+                _history.AddUser(BuildProgressReminder(task, activity, planMode));
             }
-            if (step >= 30)
+            if (step > 0 && step % StepCheckInterval == 0)
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.WriteLine($"\n[Warning: {step} steps completed out of {MaxSteps}. Do you want to continue? (y/n)]");
@@ -101,6 +111,10 @@ class CodingAgent
                 }
             }
             ChatResponse response;
+            // What the transcript weighs right now, paired below with the
+            // prompt token count Ollama reports for this same request to
+            // measure the real chars-per-token ratio.
+            var charsSent = _history.TotalChars;
             var spinner = Spinner.Start();
             try
             {
@@ -135,7 +149,10 @@ class CodingAgent
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.WriteLine($"[Ollama rejected the model's reply ({ex.Message}); retrying {streamRetries}/{MaxStreamRetries}]");
                 Console.ResetColor();
-                _history.AddUser("[Your previous reply was discarded because its tool-call syntax could not be parsed. Reply again, with correctly formatted tool calls.]");
+                // One corrective note is enough; drop copies from earlier retries.
+                const string retryNote = "[Your previous reply was discarded because its tool-call syntax could not be parsed. Reply again, with correctly formatted tool calls.]";
+                _history.RemoveUserMessages(content => content == retryNote);
+                _history.AddUser(retryNote);
                 continue;
             }
             // Ctrl+C. The 'when' filter distinguishes a user interrupt from
@@ -160,7 +177,21 @@ class CodingAgent
             spinner.Stop();
             Console.ResetColor();
 
+            // Only consecutive parse failures should abandon the task; a
+            // successful reply proves the model can still produce valid output.
+            streamRetries = 0;
+
             _lastStats = response.Stats ?? _lastStats;
+
+            // Recalibrate the trimming budget from the real token count. The
+            // initial ~4 chars/token guess overshoots for code-heavy text,
+            // and a transcript that exceeds num_ctx makes Ollama silently
+            // drop the oldest part of the prompt — usually the system prompt.
+            if (response.Stats is { PromptTokens: > 0 } tokenStats && charsSent > 0)
+            {
+                var charsPerToken = Math.Clamp((double)charsSent / tokenStats.PromptTokens, 2.0, 6.0);
+                _history.UpdateBudget((int)(_contextTokens * 0.8 * charsPerToken));
+            }
 
             // Finish the streamed line before printing tool output.
             if (response.Content.Length > 0)
@@ -186,15 +217,33 @@ class CodingAgent
                 return;
             }
 
+            var batchFailed = false;
             foreach (var call in response.ToolCalls)
             {
                 var name = call.Function.Name;
-                // Models sometimes hallucinate tools they weren't offered;
-                // in plan mode that must never change anything.
-                var result = planMode && !AgentTools.IsAllowedInPlanMode(name)
-                    ? $"Error: '{name}' is not available in plan mode. Only investigate and ask questions, then present your plan."
-                    : await _tools.ExecuteAsync(name, call.Function.Arguments);
-                activity.Record(name, call.Function.Arguments);
+                string result;
+                if (batchFailed)
+                {
+                    // Calls bundled into one reply usually depend on each
+                    // other (edit A, edit B, build); running the rest after a
+                    // failure compounds the damage and misleads the model.
+                    result = "Skipped: a previous tool call in this batch failed. Fix that first, then retry this call.";
+                }
+                else if (planMode && !AgentTools.IsAllowedInPlanMode(name))
+                {
+                    // Models sometimes hallucinate tools they weren't offered;
+                    // in plan mode that must never change anything.
+                    result = $"Error: '{name}' is not available in plan mode. Only investigate and ask questions, then present your plan.";
+                }
+                else
+                {
+                    result = await _tools.ExecuteAsync(name, call.Function.Arguments);
+                    // Skipped calls did nothing, so only executed ones count
+                    // as progress (the recap must not claim a file was edited
+                    // when the edit never ran).
+                    activity.Record(name, call.Function.Arguments);
+                }
+                batchFailed |= IsToolFailure(result);
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.WriteLine($"[{name}] {DescribeCall(name, call.Function.Arguments, result)}");
                 Console.ResetColor();
@@ -232,6 +281,15 @@ class CodingAgent
         Console.ResetColor();
     }
 
+    // Whether a tool result means the call did not do its job. Failed shell
+    // commands (non-zero exit codes) are deliberately not failures here:
+    // their output is feedback the model must see and react to.
+    private static bool IsToolFailure(string result) =>
+        result.StartsWith("Error", StringComparison.Ordinal)
+        || result.StartsWith("File not found", StringComparison.Ordinal)
+        || result.StartsWith("Unknown tool", StringComparison.Ordinal)
+        || result.StartsWith("User declined", StringComparison.Ordinal);
+
     // The argument that identifies what a tool call was about, kept alongside
     // the result so ConversationHistory can name it if the result is later
     // removed from the transcript.
@@ -246,10 +304,10 @@ class CodingAgent
     // The recap injected every ProgressReminderInterval steps. Marked as
     // automated so the model doesn't mistake it for new user instructions,
     // and built from TaskActivity so it reflects what actually happened.
-    internal static string BuildProgressReminder(string task, TaskActivity activity)
+    internal static string BuildProgressReminder(string task, TaskActivity activity, bool planMode)
     {
         var recap = new System.Text.StringBuilder();
-        recap.AppendLine("[Automated progress check — this is not a message from the user.]");
+        recap.AppendLine(ProgressReminderHeader);
         recap.AppendLine($"Original task: {task}");
         AppendReminderLine(recap, "Files edited so far", activity.Edited);
         AppendReminderLine(recap, "Files written so far", activity.Wrote);
@@ -257,7 +315,10 @@ class CodingAgent
         AppendReminderLine(recap, "Commands run so far", activity.Commands);
         recap.AppendLine("Check this against your checklist and continue with whatever remains.");
         recap.AppendLine("A file edited after you read it may differ from what you remember; re-read the relevant part before editing it again.");
-        recap.Append("When the whole task is done and verified, reply with a plain text summary and no tool calls.");
+        // Plan mode must end in a plan, not in changes-and-summary.
+        recap.Append(planMode
+            ? "When your investigation is complete, present your numbered plan as a plain text reply with no tool calls."
+            : "When the whole task is done and verified, reply with a plain text summary and no tool calls.");
         return recap.ToString();
     }
 
@@ -269,9 +330,9 @@ class CodingAgent
         }
     }
 
-    // The console line for a tool call. For read_file the file name is
-    // enough — its content goes to the model, not the terminal. Errors are
-    // still shown so the user sees what went wrong.
+    // The console line for a tool call. For read_file and edit_file the file
+    // name is enough — the content/snippet goes to the model, not the
+    // terminal. Errors are still shown so the user sees what went wrong.
     private static string DescribeCall(string name, System.Text.Json.JsonElement args, string result)
     {
         if (name == "read_file" && !result.StartsWith("Error") && !result.StartsWith("File not found"))
@@ -280,6 +341,10 @@ class CodingAgent
             var from = AgentTools.GetInt(args, "start_line");
             var to = AgentTools.GetInt(args, "end_line");
             return from is null && to is null ? path : $"{path} (lines {from?.ToString() ?? "1"}-{to?.ToString() ?? "end"})";
+        }
+        if (name == "edit_file" && result.StartsWith("Replaced"))
+        {
+            return AgentTools.GetString(args, "path") ?? "?";
         }
 
         return Summarize(result);

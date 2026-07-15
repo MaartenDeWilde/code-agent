@@ -94,6 +94,39 @@ public class ConversationHistoryTests
     }
 
     [Fact]
+    public void ShrinkingTheBudgetTrimsImmediately()
+    {
+        var history = new ConversationHistory("system prompt", maxChars: 100_000);
+        history.AddUser("task");
+        history.AddToolResult("read_file", new string('x', 10_000), subject: "a.cs");
+        AddRecentChatter(history);
+
+        // Recalibration from real token counts can lower the budget mid-task;
+        // the transcript must shrink right away, not on the next Add. (The
+        // requested 500 is raised to the 4,000-char floor, still well below
+        // the 10,000-char tool result.)
+        history.UpdateBudget(500);
+
+        var toolMessage = history.Messages.Single(m => m.Role == "tool");
+        Assert.Contains("removed", toolMessage.Content);
+    }
+
+    [Fact]
+    public void RemoveUserMessages_DeletesOnlyMatchingUserMessages()
+    {
+        var history = new ConversationHistory("system prompt", maxChars: 100_000);
+        history.AddUser("[note] outdated reminder");
+        history.AddUser("real task");
+        history.AddToolResult("read_file", "[note] looks like a note but is a tool result");
+
+        history.RemoveUserMessages(content => content.StartsWith("[note]"));
+
+        Assert.DoesNotContain(history.Messages, m => m.Role == "user" && m.Content.StartsWith("[note]"));
+        Assert.Contains(history.Messages, m => m.Role == "user" && m.Content == "real task");
+        Assert.Contains(history.Messages, m => m.Role == "tool"); // non-user messages untouched
+    }
+
+    [Fact]
     public void CountsToolCallArgumentsInBudget()
     {
         var history = new ConversationHistory("system", maxChars: 100_000);

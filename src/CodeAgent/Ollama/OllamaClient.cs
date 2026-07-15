@@ -133,8 +133,11 @@ class OllamaClient
             // The sampling defaults are tuned for chat, not agent work:
             // temperature ~0.8 is where tool-call drift and malformed JSON
             // come from, and repeat_penalty 1.1 corrupts code, which repeats
-            // indentation and brackets by nature.
-            options = new { num_ctx = contextTokens, temperature = 0.2, repeat_penalty = 1.0 }
+            // indentation and brackets by nature. Disabling the penalty makes
+            // prose loops likelier, so LooksLikeRepetitionLoop guards the
+            // stream, and num_predict caps a runaway reply outright (8192
+            // tokens still fits a large write_file call).
+            options = new { num_ctx = contextTokens, temperature = 0.2, repeat_penalty = 1.0, num_predict = 8192 }
         };
 
         var body = JsonSerializer.Serialize(request, SerializerOpts);
@@ -155,6 +158,10 @@ class OllamaClient
         var contentBuilder = new StringBuilder();
         var toolCalls = new List<ToolCall>();
         ChatStats? stats = null;
+
+        // Repetition looping is checked as the reply grows, not at the end:
+        // a looping model may never finish on its own.
+        var nextLoopCheck = 2_000;
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var reader = new StreamReader(stream);
@@ -196,6 +203,17 @@ class OllamaClient
             {
                 contentBuilder.Append(message.Content);
                 onToken(message.Content);
+
+                if (contentBuilder.Length >= nextLoopCheck)
+                {
+                    nextLoopCheck = contentBuilder.Length + 1_000;
+                    if (LooksLikeRepetitionLoop(contentBuilder.ToString()))
+                    {
+                        // Same failure contract as Ollama's own mid-stream
+                        // errors: the caller discards the reply and retries.
+                        throw new OllamaStreamException("the model is repeating the same lines over and over");
+                    }
+                }
             }
 
             if (message.ToolCalls is { Count: > 0 })
@@ -205,6 +223,34 @@ class OllamaClient
         }
 
         return new ChatResponse(contentBuilder.ToString(), toolCalls, stats);
+    }
+
+    // Degeneration check: with repeat_penalty disabled, a small model can
+    // fall into re-emitting the same few sentences forever ("Wait, I'll fix
+    // X first. / Actually, I'll do it all at once." ad infinitum). A real,
+    // wordy line recurring this often in one reply is a loop, not style.
+    // Lines must contain letters (markdown table rules don't) and some
+    // length (lone braces and ``` fences repeat legitimately in code talk).
+    internal static bool LooksLikeRepetitionLoop(string content)
+    {
+        const int minLineLength = 10;
+        const int loopThreshold = 5;
+
+        var counts = new Dictionary<string, int>();
+        foreach (var rawLine in content.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length < minLineLength || !line.Any(char.IsLetter) || line.StartsWith("```"))
+            {
+                continue;
+            }
+            if ((counts[line] = counts.GetValueOrDefault(line) + 1) >= loopThreshold)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private class ChatChunk

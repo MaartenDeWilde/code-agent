@@ -88,6 +88,44 @@ public class OllamaClientTests
     }
 
     [Fact]
+    public void LooksLikeRepetitionLoop_FlagsACyclingReply()
+    {
+        // The failure seen live: a deliberation cycle repeated verbatim.
+        var cycle = "Wait, I'll just fix the redundant code first.\n"
+                  + "Actually, I'll just do it all at once.\n"
+                  + "I'll add the using statement and fix the redundant code.\n";
+        var looping = string.Concat(Enumerable.Repeat(cycle, 8));
+
+        Assert.True(OllamaClient.LooksLikeRepetitionLoop(looping));
+    }
+
+    [Fact]
+    public void LooksLikeRepetitionLoop_AcceptsRepetitiveButLegitimateText()
+    {
+        // Code fences, braces and table rules repeat by nature; a long
+        // normal answer must not be mistaken for a loop.
+        var legitimate = string.Concat(Enumerable.Range(1, 8).Select(i =>
+            $"Step {i}: change file number {i} accordingly.\n```\nif (x) {{\n}}\n```\n| --- | --- |\n"));
+
+        Assert.False(OllamaClient.LooksLikeRepetitionLoop(legitimate));
+    }
+
+    [Fact]
+    public async Task ChatAsync_LoopingReply_IsAbortedMidStream()
+    {
+        // One big chunk pushes the reply past the first loop checkpoint.
+        var looping = string.Concat(Enumerable.Repeat("Wait, I'll fix the redundant code first.\nActually, I'll do it all at once.\n", 40));
+        var chunk = System.Text.Json.JsonSerializer.Serialize(
+            new { message = new { role = "assistant", content = looping }, done = false });
+        var client = ClientServing(chunk);
+
+        var ex = await Assert.ThrowsAsync<OllamaStreamException>(() =>
+            client.ChatAsync("m", AnyHistory, tools: [], contextTokens: 8192, onToken: _ => { }));
+
+        Assert.Contains("repeating", ex.Message);
+    }
+
+    [Fact]
     public async Task ChatAsync_NonSuccessStatus_SurfacesOllamaBody()
     {
         var response = new HttpResponseMessage(HttpStatusCode.NotFound)

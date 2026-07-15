@@ -85,8 +85,8 @@ class CodingAgent
     // constant for every failure shape, so old copies can be removed by
     // exact match when a fresh one is added.
     private const string MalformedReplyNote =
-        "[Your previous reply was discarded because it was malformed (bad tool-call syntax, raw template markup, or empty). "
-        + "Reply again: call a tool using the native tool-calling format, or give your final answer as plain text.]";
+        "[Your previous reply was discarded because it was malformed (bad tool-call syntax, raw template markup, endless repetition, or empty). "
+        + "Reply again, briefly and without repeating yourself: call a tool using the native tool-calling format, or give your final answer as plain text.]";
 
     // Chat-template control tokens that belong to the wire format, never in
     // reply text: Harmony (gpt-oss) and ChatML (qwen, ...). Ollama's parser
@@ -205,12 +205,12 @@ class CodingAgent
 
                 if (++streamRetries > MaxStreamRetries)
                 {
-                    Console.WriteLine($"[giving up after {MaxStreamRetries} retries — Ollama keeps rejecting the model's output: {ex.Message}]");
+                    Console.WriteLine($"[giving up after {MaxStreamRetries} retries — the model keeps producing unusable replies: {ex.Message}]");
                     return;
                 }
 
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[Ollama rejected the model's reply ({ex.Message}); retrying {streamRetries}/{MaxStreamRetries}]");
+                Console.WriteLine($"[reply discarded ({ex.Message}); retrying {streamRetries}/{MaxStreamRetries}]");
                 Console.ResetColor();
                 // One corrective note is enough; drop copies from earlier retries.
                 _history.RemoveUserMessages(content => content == MalformedReplyNote);

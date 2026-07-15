@@ -57,7 +57,7 @@ class CodingAgent
 
         try
         {
-            await RunLoopAsync(tools, planMode, activity, cancellationToken);
+            await RunLoopAsync(task, tools, planMode, activity, cancellationToken);
         }
         finally
         {
@@ -72,12 +72,22 @@ class CodingAgent
     // is retried before the task is abandoned.
     private const int MaxStreamRetries = 3;
 
-    private async Task RunLoopAsync(object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
+    // Every this many steps the original task and the progress so far are
+    // re-injected into the transcript. Long multi-file tasks push the task
+    // statement far behind a wall of tool traffic, and small models drift off
+    // or forget what remains; a periodic recap anchors them again.
+    private const int ProgressReminderInterval = 8;
+
+    private async Task RunLoopAsync(string task, object[] tools, bool planMode, TaskActivity activity, CancellationToken cancellationToken)
     {
         var streamRetries = 0;
         for (var step = 0; step < MaxSteps; step++)
         {
             activity.Turns++;
+            if (step > 0 && step % ProgressReminderInterval == 0)
+            {
+                _history.AddUser(BuildProgressReminder(task, activity));
+            }
             if (step >= 30)
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
@@ -188,7 +198,7 @@ class CodingAgent
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.WriteLine($"[{name}] {DescribeCall(name, call.Function.Arguments, result)}");
                 Console.ResetColor();
-                _history.AddToolResult(name, result);
+                _history.AddToolResult(name, result, SubjectOf(name, call.Function.Arguments));
 
                 // Honor Ctrl+C between tool calls too, not just while the
                 // model is generating.
@@ -207,7 +217,7 @@ class CodingAgent
     // E.g. "[context: 12,840 chars, 40% of budget | last request: 3,105 prompt
     // + 210 reply tokens, 24.8 tok/s]". The budget is what ConversationHistory
     // trims down to, so >100% can occur briefly when recent messages are too
-    // large to elide. Token counts come straight from Ollama when available;
+    // large to remove. Token counts come straight from Ollama when available;
     // otherwise fall back to the ~4 chars/token estimate.
     private void PrintContextSize()
     {
@@ -220,6 +230,43 @@ class CodingAgent
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine(line);
         Console.ResetColor();
+    }
+
+    // The argument that identifies what a tool call was about, kept alongside
+    // the result so ConversationHistory can name it if the result is later
+    // removed from the transcript.
+    private static string? SubjectOf(string name, System.Text.Json.JsonElement args) => name switch
+    {
+        "read_file" or "write_file" or "edit_file" => AgentTools.GetString(args, "path"),
+        "search_files" or "list_files" => AgentTools.GetString(args, "pattern"),
+        "run_command" => AgentTools.GetString(args, "command"),
+        _ => null
+    };
+
+    // The recap injected every ProgressReminderInterval steps. Marked as
+    // automated so the model doesn't mistake it for new user instructions,
+    // and built from TaskActivity so it reflects what actually happened.
+    internal static string BuildProgressReminder(string task, TaskActivity activity)
+    {
+        var recap = new System.Text.StringBuilder();
+        recap.AppendLine("[Automated progress check — this is not a message from the user.]");
+        recap.AppendLine($"Original task: {task}");
+        AppendReminderLine(recap, "Files edited so far", activity.Edited);
+        AppendReminderLine(recap, "Files written so far", activity.Wrote);
+        AppendReminderLine(recap, "Files read so far", activity.Read);
+        AppendReminderLine(recap, "Commands run so far", activity.Commands);
+        recap.AppendLine("Check this against your checklist and continue with whatever remains.");
+        recap.AppendLine("A file edited after you read it may differ from what you remember; re-read the relevant part before editing it again.");
+        recap.Append("When the whole task is done and verified, reply with a plain text summary and no tool calls.");
+        return recap.ToString();
+    }
+
+    private static void AppendReminderLine(System.Text.StringBuilder recap, string label, IReadOnlyList<string> items)
+    {
+        if (items.Count > 0)
+        {
+            recap.AppendLine($"{label}: {string.Join(", ", items)}");
+        }
     }
 
     // The console line for a tool call. For read_file the file name is
@@ -282,8 +329,11 @@ class CodingAgent
         Console.WriteLine($"  {label + ":",-9} {shown}");
     }
 
-    /// <summary>What the agent did during one task, for the end-of-task recap.</summary>
-    private sealed class TaskActivity
+    /// <summary>
+    /// What the agent did during one task, for the end-of-task recap and the
+    /// periodic progress reminder.
+    /// </summary>
+    internal sealed class TaskActivity
     {
         public int Turns;
         public int QuestionsAsked;
@@ -352,6 +402,12 @@ class CodingAgent
         content is substantially different. After changing code, verify your
         work with run_command (build or test) when the project has a suitable
         command.
+
+        When a task requires changing MORE THAN ONE file, start with a short
+        numbered checklist — one line per file with the change it needs — in
+        the text of the same message as your first tool call (a text-only
+        reply would end the task). Then work through the checklist in order,
+        and use it to check what remains before you finish.
 
         If the task is ambiguous or an important decision could go multiple
         ways, use ask_user to check with the user instead of guessing.

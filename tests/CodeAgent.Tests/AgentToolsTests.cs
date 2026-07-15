@@ -203,6 +203,38 @@ public class AgentToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task EditFile_ReturnsEditedRegionWithContext()
+    {
+        // Ten numbered lines; the edit lands on line 6.
+        CreateFile("a.cs", ManyLines("alpha", 10));
+
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "a.cs", find = "alpha line number 6;", replace = "alpha line number SIX;" }));
+
+        // The snippet shows the new text in read_file's numbered format plus
+        // surrounding context, so the model can follow up without re-reading.
+        Assert.Contains("The file now reads (lines 2-10 of 10)", result);
+        Assert.Contains("6: alpha line number SIX;", result);
+        Assert.Contains("2: alpha line number 2;", result); // context above
+        Assert.Contains("10: alpha line number 10;", result); // context below
+    }
+
+    [Fact]
+    public async Task EditFile_LargeReplacement_TruncatesSnippet()
+    {
+        CreateFile("a.cs", "start\nMIDDLE\nend");
+
+        var result = await _tools.ExecuteAsync("edit_file",
+            Args(new { path = "a.cs", find = "MIDDLE", replace = ManyLines("beta", 100) }));
+
+        // The model wrote those 100 lines itself; echoing them all back would
+        // only burn context.
+        Assert.StartsWith("Replaced", result);
+        Assert.Contains("not shown", result);
+        Assert.DoesNotContain("beta line number 60;", result);
+    }
+
+    [Fact]
     public async Task EditFile_AmbiguousMatch_ReturnsError()
     {
         CreateFile("a.cs", "int a;\nint a;\n");

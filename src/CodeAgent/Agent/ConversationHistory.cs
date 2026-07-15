@@ -12,11 +12,19 @@ namespace CodeAgent.Agent;
 /// </summary>
 class ConversationHistory
 {
-    // The most recent messages are never elided: the model needs them to
+    // The most recent messages are never removed: the model needs them to
     // continue the current task.
     private const int KeepRecentCount = 6;
 
-    private const string ElidedMarker = "[older tool result elided to save context]";
+    // What replaces a removed tool result. Naming the tool and its subject
+    // (file path, pattern, command) matters: the model can then re-issue that
+    // exact call when it needs the content again, instead of editing a file
+    // it only remembers.
+    private static string RemovedMarker(ChatMessage message)
+    {
+        var subject = message.ToolSubject is { Length: > 0 } s ? $" for '{s}'" : "";
+        return $"[older {message.ToolName} result{subject} removed to save space — call the tool again if you still need it]";
+    }
 
     private readonly List<ChatMessage> _messages = new();
 
@@ -45,8 +53,10 @@ class ConversationHistory
             ToolCalls = toolCalls.Count > 0 ? toolCalls : null
         });
 
-    public void AddToolResult(string toolName, string result) =>
-        Add(new ChatMessage { Role = "tool", ToolName = toolName, Content = result });
+    /// <param name="subject">The call's main argument (file path, pattern,
+    /// command), used to describe the result if it is later removed.</param>
+    public void AddToolResult(string toolName, string result, string? subject = null) =>
+        Add(new ChatMessage { Role = "tool", ToolName = toolName, Content = result, ToolSubject = subject });
 
     private void Add(ChatMessage message)
     {
@@ -63,16 +73,19 @@ class ConversationHistory
         }
 
         // Old tool traffic is the bulkiest and least important part of the
-        // transcript once the model has acted on it, so elide it oldest
+        // transcript once the model has acted on it, so remove it oldest
         // first. Index 0 is the system prompt and is always skipped.
         for (var i = 1; i < _messages.Count - KeepRecentCount && total > MaxChars; i++)
         {
             var message = _messages[i];
 
-            if (message.Role == "tool" && message.Content.Length > ElidedMarker.Length)
+            // Only replace content when the marker is actually smaller: this
+            // both guarantees progress and makes a second pass a no-op.
+            if (message.Role == "tool" && message.Content.Length > RemovedMarker(message).Length)
             {
-                total -= message.Content.Length - ElidedMarker.Length;
-                message.Content = ElidedMarker;
+                var marker = RemovedMarker(message);
+                total -= message.Content.Length - marker.Length;
+                message.Content = marker;
             }
 
             // Tool-call arguments (e.g. a whole file passed to write_file)
@@ -80,7 +93,7 @@ class ConversationHistory
             if (message.Role == "assistant" && message.ToolCalls is not null)
             {
                 var names = string.Join(", ", message.ToolCalls.Select(c => c.Function.Name));
-                var note = $"[earlier tool calls elided: {names}]";
+                var note = $"[earlier tool calls removed to save space: {names}]";
                 total -= message.ToolCalls.Sum(ArgumentSize) + message.Content.Length;
                 message.ToolCalls = null;
                 message.Content = string.IsNullOrEmpty(message.Content) ? note : $"{message.Content}\n{note}";

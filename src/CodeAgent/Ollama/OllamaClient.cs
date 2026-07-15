@@ -25,6 +25,13 @@ class ChatMessage
     // Present on 'tool' role messages: which tool produced this result.
     [JsonPropertyName("tool_name")]
     public string? ToolName { get; set; }
+
+    // Local bookkeeping, never sent to the model: the main argument of the
+    // call that produced this result (file path, search pattern, command).
+    // Lets ConversationHistory say WHAT was removed, so the model knows which
+    // tool call to repeat instead of working from memory.
+    [JsonIgnore]
+    public string? ToolSubject { get; set; }
 }
 
 class ToolCall

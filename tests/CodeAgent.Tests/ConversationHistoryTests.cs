@@ -36,7 +36,7 @@ public class ConversationHistoryTests
     }
 
     [Fact]
-    public void ElidesOldestToolResultsWhenOverBudget()
+    public void RemovesOldestToolResultsWhenOverBudget()
     {
         var history = new ConversationHistory("system prompt", maxChars: 500);
         history.AddUser("task");
@@ -44,8 +44,41 @@ public class ConversationHistoryTests
         AddRecentChatter(history);
 
         var toolMessage = history.Messages.Single(m => m.Role == "tool");
-        Assert.Contains("elided", toolMessage.Content);
+        Assert.Contains("removed", toolMessage.Content);
         Assert.True(history.TotalChars < 2000);
+    }
+
+    [Fact]
+    public void RemovedMarkerNamesToolAndSubject()
+    {
+        var history = new ConversationHistory("system prompt", maxChars: 500);
+        history.AddUser("task");
+        history.AddToolResult("read_file", new string('x', 2000), subject: "src/OrderService.cs");
+        AddRecentChatter(history);
+
+        // The model must be able to tell WHICH call to repeat when it needs
+        // the content again, not just that something went missing.
+        var toolMessage = history.Messages.Single(m => m.Role == "tool");
+        Assert.Contains("read_file", toolMessage.Content);
+        Assert.Contains("src/OrderService.cs", toolMessage.Content);
+    }
+
+    [Fact]
+    public void RemovingTwiceIsANoOp()
+    {
+        var history = new ConversationHistory("system prompt", maxChars: 500);
+        history.AddUser("task");
+        history.AddToolResult("read_file", new string('x', 2000), subject: "a.cs");
+        AddRecentChatter(history);
+        var afterFirstTrim = history.Messages.Single(m => m.Role == "tool").Content;
+
+        // Blow the budget again so trimming re-visits the old messages: the
+        // existing marker must survive as-is instead of being wrapped or
+        // replaced again.
+        history.AddToolResult("read_file", new string('y', 2000), subject: "b.cs");
+        AddRecentChatter(history);
+
+        Assert.Equal(afterFirstTrim, history.Messages.First(m => m.Role == "tool").Content);
     }
 
     [Fact]
@@ -74,7 +107,7 @@ public class ConversationHistoryTests
     }
 
     [Fact]
-    public void ElidesOldToolCallArgumentsWhenOverBudget()
+    public void RemovesOldToolCallArgumentsWhenOverBudget()
     {
         var history = new ConversationHistory("system", maxChars: 500);
         history.AddAssistant("", new List<ToolCall>
@@ -86,7 +119,7 @@ public class ConversationHistoryTests
 
         var assistant = history.Messages.Single(m => m.Role == "assistant");
         Assert.Null(assistant.ToolCalls);
-        Assert.Contains("write_file", assistant.Content); // note says what was elided
+        Assert.Contains("write_file", assistant.Content); // note says what was removed
         Assert.True(history.TotalChars < 5000);
     }
 }

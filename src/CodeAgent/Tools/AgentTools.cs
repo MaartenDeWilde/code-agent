@@ -372,8 +372,47 @@ class AgentTools
             return "Error: 'find' text appears more than once. Include more surrounding context to make it unique.";
         }
 
-        File.WriteAllText(fullPath, content[..first] + replace + content[(first + find.Length)..]);
-        return $"Replaced {find.Length} characters with {replace.Length} characters in {relativePath}";
+        var updated = content[..first] + replace + content[(first + find.Length)..];
+        File.WriteAllText(fullPath, updated);
+
+        // Echo the edited region back as it now exists on disk. The model's
+        // only other picture of the file is an earlier read_file, which this
+        // edit just made stale; without fresh text, follow-up edits tend to
+        // 'find' snippets that no longer exist.
+        var firstChangedLine = CountLines(content[..first]);
+        return $"Replaced {find.Length} characters with {replace.Length} characters in {relativePath}.\n"
+            + SnippetAround(updated, firstChangedLine, CountLines(replace));
+    }
+
+    // The lines spanned by an edit plus a little context, in read_file's
+    // numbered format. Bounded so a large replacement (which the model just
+    // wrote itself) isn't echoed back in full.
+    private static string SnippetAround(string content, int firstLine, int lineCount)
+    {
+        const int contextLines = 4;
+        const int maxSnippetLines = 40;
+
+        var lines = content.Split('\n');
+        var from = Math.Max(firstLine - contextLines, 1);
+        var to = Math.Min(firstLine + lineCount - 1 + contextLines, lines.Length);
+        var truncated = to - from + 1 > maxSnippetLines;
+        if (truncated)
+        {
+            to = from + maxSnippetLines - 1;
+        }
+
+        var snippet = new StringBuilder();
+        snippet.AppendLine($"The file now reads (lines {from}-{to} of {lines.Length}):");
+        for (var lineNo = from; lineNo <= to; lineNo++)
+        {
+            snippet.AppendLine($"{lineNo,5}: {lines[lineNo - 1]}");
+        }
+        if (truncated)
+        {
+            snippet.AppendLine("...[rest of the edited region not shown; read_file to see more]");
+        }
+
+        return snippet.ToString().TrimEnd();
     }
 
     private async Task<string> RunCommandAsync(string command)

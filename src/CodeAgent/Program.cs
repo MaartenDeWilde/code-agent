@@ -1,5 +1,8 @@
 using CodeAgent.Agent;
 using CodeAgent.Ollama;
+using Serilog;
+using Serilog.Extensions.Logging;
+using Serilog.Formatting.Compact;
 
 static void DisplayLogo()
 {
@@ -13,6 +16,25 @@ Console.Clear();
 
 DisplayLogo();
 Console.WriteLine();
+
+// --- 0. Logging: Serilog is the provider, but everything else in the app
+// only sees Microsoft.Extensions.Logging.ILogger — the standard .NET pattern
+// that keeps the logging library swappable. Logs go to files next to the app
+// (never into the user's project, and never to the console, which the agent
+// UI owns): a human-readable .log and a machine-readable .clef (newline-
+// delimited JSON) that structured-log tooling can query by property.
+var logsFolder = Path.Combine(AppContext.BaseDirectory, "logs");
+var serilog = new LoggerConfiguration()
+    .MinimumLevel.Debug()
+    // Carries BeginScope properties (like TaskId) onto every event.
+    .Enrich.FromLogContext()
+    .WriteTo.File(Path.Combine(logsFolder, "agent-.log"),
+        rollingInterval: RollingInterval.Day, retainedFileCountLimit: 14)
+    .WriteTo.File(new CompactJsonFormatter(), Path.Combine(logsFolder, "agent-.clef"),
+        rollingInterval: RollingInterval.Day, retainedFileCountLimit: 14)
+    .CreateLogger();
+// dispose: true flushes buffered log events when the factory is disposed.
+using var loggerFactory = new SerilogLoggerFactory(serilog, dispose: true);
 
 // --- 1. Ask for the folder the agent is allowed to work in ---
 string rootFolder;
@@ -55,6 +77,7 @@ Console.WriteLine();
 Console.WriteLine($"Working folder: {rootFolder}");
 Console.WriteLine($"Model:          {model}");
 Console.WriteLine($"Context:        {contextTokens:N0} tokens");
+Console.WriteLine($"Logging to:     {logsFolder}");
 Console.WriteLine();
 Console.WriteLine("Welcome to the Coding Agent! Enter your task below, or use these commands:");
 Console.WriteLine("-----------------------------------------------");
@@ -69,7 +92,7 @@ Console.WriteLine("  clear             - Reset the conversation history and star
 Console.WriteLine("  exit              - Exit the application.");
 Console.WriteLine();
 
-var agent = new CodingAgent(rootFolder, model, contextTokens);
+var agent = new CodingAgent(rootFolder, model, contextTokens, loggerFactory);
 
 // Ctrl+C while a task runs cancels the task instead of killing the app;
 // Ctrl+C at the prompt exits as usual.
@@ -98,7 +121,7 @@ while (true)
     }
     if (task.Equals("clear", StringComparison.OrdinalIgnoreCase))
     {
-        agent = new CodingAgent(rootFolder, model, contextTokens);
+        agent = new CodingAgent(rootFolder, model, contextTokens, loggerFactory);
         Console.WriteLine("[conversation cleared]");
         continue;
     }

@@ -1,9 +1,9 @@
+using CodeAgent.Guardrails;
 using CodeAgent.Ollama;
 using CodeAgent.Tools;
 using CodeAgent.Ui;
-// The class is named like its namespace, so a plain 'using' would make the
-// bare name 'Guardrails' resolve to the namespace; import the members instead.
-using static CodeAgent.Guardrails.Guardrails;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeAgent.Agent;
 
@@ -20,9 +20,10 @@ class CodingAgent
     /// <summary>The Ollama model in use; may be switched between tasks.</summary>
     public string Model { get; set; }
     private readonly int _contextTokens;
-    private readonly OllamaClient _ollama = new();
+    private readonly OllamaClient _ollama;
     private readonly AgentTools _tools;
     private readonly ConversationHistory _history;
+    private readonly ILogger _logger;
 
     // Token counts reported by Ollama for the most recent request; more
     // accurate than any estimate we can make from character counts.
@@ -40,11 +41,18 @@ class CodingAgent
     // is accepted; null when the project's stack isn't recognized.
     private readonly string? _verifyCommand;
 
-    public CodingAgent(string rootFolder, string model, int contextTokens)
+    public CodingAgent(string rootFolder, string model, int contextTokens, ILoggerFactory? loggerFactory = null)
     {
         Model = model;
         _contextTokens = contextTokens;
         _verifyCommand = ProjectVerification.DetectCommand(rootFolder);
+
+        // Code against the ILogger ABSTRACTION, not a concrete library:
+        // Program.cs decides the provider (Serilog), and tests get a no-op
+        // logger for free by leaving the factory out.
+        loggerFactory ??= NullLoggerFactory.Instance;
+        _logger = loggerFactory.CreateLogger<CodingAgent>();
+        _ollama = new OllamaClient(logger: loggerFactory.CreateLogger<OllamaClient>());
 
         // Trim the transcript at ~80% of the window (at ~4 chars per token),
         // keeping the rest free for the model's reply and tool schemas.
@@ -54,7 +62,8 @@ class CodingAgent
         // Cap individual tool results relative to the budget so one huge file
         // or command output can't monopolize the window, while still letting
         // big contexts see much more than small ones.
-        _tools = new AgentTools(rootFolder, Math.Clamp(maxChars / 16, 8_000, 100_000));
+        _tools = new AgentTools(rootFolder, Math.Clamp(maxChars / 16, 8_000, 100_000),
+            loggerFactory.CreateLogger<AgentTools>());
     }
 
     /// <summary>
@@ -67,10 +76,16 @@ class CodingAgent
 
     public async Task RunAsync(string task, bool planMode = false, CancellationToken cancellationToken = default)
     {
-        if (!IsSafe(task))
+        // Input rail: screen the request before it ever reaches the model.
+        // Blocks are logged at Warning — they are the security-relevant
+        // events someone reviewing the log actually looks for.
+        var verdict = GuardrailPipeline.CheckUserInput(task);
+        if (!verdict.Allowed)
         {
+            _logger.LogWarning("Guardrail {Rule} blocked user input: {Reason}. Input: {Task}",
+                verdict.Rule, verdict.Reason, task);
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[Security Error: {GetErrorMessage()}]");
+            Console.WriteLine($"[blocked by guardrail '{verdict.Rule}': {verdict.Reason}]");
             Console.ResetColor();
             return;
         }
@@ -79,12 +94,17 @@ class CodingAgent
         var tools = planMode ? AgentTools.PlanDefinitions : AgentTools.Definitions;
         var activity = new TaskActivity();
 
+        // Every log line inside the task carries this id, so one task's
+        // events can be filtered out of an interleaved log file.
+        using var taskScope = _logger.BeginScope("Task {TaskId}", Guid.NewGuid());
+        _logger.LogInformation("Task started: {Task} (model {Model}, plan mode: {PlanMode})", task, Model, planMode);
         try
         {
             await RunLoopAsync(task, tools, planMode, activity, cancellationToken);
         }
         finally
         {
+            _logger.LogInformation("Task ended after {Turns} turns", activity.Turns);
             // Whichever way the task ended, recap what happened and show how
             // full the context is.
             PrintTaskSummary(activity);
@@ -393,6 +413,11 @@ class CodingAgent
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.WriteLine($"[{name}] {DescribeCall(name, call.Function.Arguments, result)}");
                 Console.ResetColor();
+                // Log the call and its outcome, not the full result: tool
+                // results can be whole files, and logs should record what
+                // happened without duplicating the project's contents.
+                _logger.LogInformation("Tool {ToolName} on {ToolSubject}: {ToolOutcome}",
+                    name, SubjectOf(name, call.Function.Arguments), Summarize(result));
                 _history.AddToolResult(name, result, SubjectOf(name, call.Function.Arguments));
 
                 // Honor Ctrl+C between tool calls too, not just while the
@@ -455,7 +480,8 @@ class CodingAgent
         result.StartsWith("Error", StringComparison.Ordinal)
         || result.StartsWith("File not found", StringComparison.Ordinal)
         || result.StartsWith("Unknown tool", StringComparison.Ordinal)
-        || result.StartsWith("User declined", StringComparison.Ordinal);
+        || result.StartsWith("User declined", StringComparison.Ordinal)
+        || result.StartsWith("Blocked by guardrail", StringComparison.Ordinal);
 
     // The argument that identifies what a tool call was about, kept alongside
     // the result so ConversationHistory can name it if the result is later

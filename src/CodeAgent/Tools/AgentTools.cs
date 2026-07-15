@@ -2,6 +2,9 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using CodeAgent.Guardrails;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeAgent.Tools;
 
@@ -44,10 +47,13 @@ class AgentTools
     // rejection the model gets the benefit of the doubt and the user decides.
     private readonly Dictionary<string, int> _rewriteRejections = new();
 
-    public AgentTools(string rootFolder, int maxResultChars)
+    private readonly ILogger _logger;
+
+    public AgentTools(string rootFolder, int maxResultChars, ILogger? logger = null)
     {
         _rootFolder = rootFolder;
         _maxResultChars = maxResultChars;
+        _logger = logger ?? NullLogger.Instance;
     }
 
     // All tool schemas, keyed by name, advertised via Ollama's native tool calling.
@@ -546,6 +552,18 @@ class AgentTools
         if (string.IsNullOrWhiteSpace(command))
         {
             return "Error: command is required.";
+        }
+
+        // Command rail: known-catastrophic commands are refused outright,
+        // before the user is even asked. User confirmation protects against
+        // an overeager model; this protects against a confirmation clicked
+        // through on autopilot.
+        var verdict = GuardrailPipeline.CheckCommand(command);
+        if (!verdict.Allowed)
+        {
+            _logger.LogWarning("Guardrail {Rule} blocked command: {Reason}. Command: {Command}",
+                verdict.Rule, verdict.Reason, command);
+            return $"Blocked by guardrail '{verdict.Rule}': {verdict.Reason}. This command will not be run; take a safer approach.";
         }
 
         // Shell access is the most dangerous tool; every command needs an

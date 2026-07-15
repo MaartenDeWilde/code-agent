@@ -1,6 +1,8 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeAgent.Ollama;
 
@@ -80,14 +82,18 @@ class OllamaStreamException(string message) : Exception(message);
 class OllamaClient
 {
     private readonly HttpClient _http;
+    private readonly ILogger _logger;
 
-    public OllamaClient(HttpClient? http = null) =>
+    public OllamaClient(HttpClient? http = null, ILogger? logger = null)
+    {
         _http = http ?? new HttpClient
         {
             BaseAddress = new Uri("http://localhost:11434"),
             // Local models can take a while to respond; the HttpClient default of 100s is too short.
             Timeout = TimeSpan.FromMinutes(10)
         };
+        _logger = logger ?? NullLogger.Instance;
+    }
 
     private static readonly JsonSerializerOptions SerializerOpts = new()
     {
@@ -140,6 +146,14 @@ class OllamaClient
             options = new { num_ctx = contextTokens, temperature = 0.2, repeat_penalty = 1.0, num_predict = 8192 }
         };
 
+        // One log event per request/response pair, with the numbers that
+        // matter for cost and latency. Message CONTENT deliberately stays out
+        // at Information level — transcripts routinely contain the user's
+        // code and secrets, and logs travel further than transcripts do.
+        _logger.LogDebug("LLM request: model {Model}, {MessageCount} messages, {ToolCount} tools, num_ctx {ContextTokens}",
+            model, history.Count, tools.Length, contextTokens);
+        var startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+
         var body = JsonSerializer.Serialize(request, SerializerOpts);
         using var content = new StringContent(body, Encoding.UTF8, "application/json");
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "/api/chat") { Content = content };
@@ -175,6 +189,7 @@ class OllamaClient
             var chunk = JsonSerializer.Deserialize<ChatChunk>(line);
             if (chunk?.Error is { } chunkError)
             {
+                _logger.LogWarning("LLM stream error from model {Model}: {Error}", model, chunkError);
                 throw new OllamaStreamException(chunkError);
             }
 
@@ -221,6 +236,17 @@ class OllamaClient
                 toolCalls.AddRange(message.ToolCalls);
             }
         }
+
+        // Property names follow the OpenTelemetry GenAI semantic conventions
+        // (gen_ai.usage.input_tokens, ...) with the dots that message
+        // templates don't allow flattened to underscores, so the fields stay
+        // recognizable if this ever feeds a real telemetry pipeline.
+        _logger.LogInformation(
+            "LLM response: model {gen_ai_request_model}, {gen_ai_usage_input_tokens} input + {gen_ai_usage_output_tokens} output tokens, "
+            + "{ToolCallCount} tool calls, {ContentChars} content chars, {TokensPerSecond:F1} tok/s, {DurationMs} ms",
+            model, stats?.PromptTokens, stats?.ReplyTokens,
+            toolCalls.Count, contentBuilder.Length, stats?.TokensPerSecond,
+            (long)System.Diagnostics.Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
 
         return new ChatResponse(contentBuilder.ToString(), toolCalls, stats);
     }

@@ -12,7 +12,7 @@ namespace CodeAgent.Agent;
 class CodingAgent
 {
     // Build/fix cycles take many steps; give the agent room to iterate.
-    private const int MaxSteps = 30;
+    private const int MaxSteps = 100;
 
     /// <summary>The Ollama model in use; may be switched between tasks.</summary>
     public string Model { get; set; }
@@ -78,6 +78,18 @@ class CodingAgent
         for (var step = 0; step < MaxSteps; step++)
         {
             activity.Turns++;
+            if (step >= 30)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"\n[Warning: {step} steps completed out of {MaxSteps}. Do you want to continue? (y/n)]");
+                Console.ResetColor();
+                var responseLine = Console.ReadLine();
+                if (responseLine?.ToLower() != "y")
+                {
+                    Console.WriteLine("[Task aborted by user]");
+                    return;
+                }
+            }
             ChatResponse response;
             var spinner = Spinner.Start();
             try

@@ -19,6 +19,9 @@ project.lock.json
 .idea/
 *.swp
 
+# Claude Code local settings
+.claude/
+
 # Rider
 *.sln.iml
 

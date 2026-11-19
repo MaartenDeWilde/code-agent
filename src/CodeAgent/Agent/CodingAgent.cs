@@ -1,4 +1,5 @@
 using CodeAgent.Guardrails;
+using CodeAgent.Llm;
 using CodeAgent.Ollama;
 using CodeAgent.Tools;
 using CodeAgent.Ui;
@@ -17,10 +18,10 @@ class CodingAgent
     // Build/fix cycles take many steps; give the agent room to iterate.
     private const int MaxSteps = 100;
 
-    /// <summary>The Ollama model in use; may be switched between tasks.</summary>
+    /// <summary>The model in use; may be switched between tasks.</summary>
     public string Model { get; set; }
     private readonly int _contextTokens;
-    private readonly OllamaClient _ollama;
+    private readonly IChatClient _client;
     private readonly AgentTools _tools;
     private readonly ConversationHistory _history;
     private readonly ILogger _logger;
@@ -41,7 +42,9 @@ class CodingAgent
     // is accepted; null when the project's stack isn't recognized.
     private readonly string? _verifyCommand;
 
-    public CodingAgent(string rootFolder, string model, int contextTokens, ILoggerFactory? loggerFactory = null)
+    /// <param name="client">The model server to talk to; Ollama when left out.</param>
+    public CodingAgent(string rootFolder, string model, int contextTokens, ILoggerFactory? loggerFactory = null,
+        IChatClient? client = null)
     {
         Model = model;
         _contextTokens = contextTokens;
@@ -52,7 +55,7 @@ class CodingAgent
         // logger for free by leaving the factory out.
         loggerFactory ??= NullLoggerFactory.Instance;
         _logger = loggerFactory.CreateLogger<CodingAgent>();
-        _ollama = new OllamaClient(logger: loggerFactory.CreateLogger<OllamaClient>());
+        _client = client ?? new OllamaClient(logger: loggerFactory.CreateLogger<OllamaClient>());
 
         // Trim the transcript at ~80% of the window (at ~4 chars per token),
         // keeping the rest free for the model's reply and tool schemas.
@@ -212,7 +215,7 @@ class CodingAgent
                 // Stream tokens straight to the console; the spinner is
                 // visible until the first token arrives, and again whenever
                 // the model goes quiet to think.
-                response = await _ollama.ChatAsync(Model, _history.Messages, tools, _contextTokens,
+                response = await _client.ChatAsync(Model, _history.Messages, tools, _contextTokens,
                     onToken: text =>
                     {
                         spinner.Stop();
@@ -239,11 +242,11 @@ class CodingAgent
                     },
                     cancellationToken);
             }
-            // Ollama aborts the stream when it cannot parse the model's
-            // tool-call output (e.g. "XML syntax error ..."). The reply never
-            // reached the transcript, so resampling — nudged by a corrective
-            // note — usually recovers.
-            catch (OllamaStreamException ex)
+            // The backend aborts the stream when it cannot parse the model's
+            // tool-call output (e.g. Ollama's "XML syntax error ..."), or the
+            // reply degenerated. It never reached the transcript, so
+            // resampling — nudged by a corrective note — usually recovers.
+            catch (ModelStreamException ex)
             {
                 spinner.Stop();
                 Console.ResetColor(); // tokens may have been streaming in green
@@ -279,7 +282,7 @@ class CodingAgent
             {
                 spinner.Stop();
                 Console.ResetColor(); // tokens may have been streaming in green
-                Console.WriteLine($"[error talking to Ollama: {ex.Message}]");
+                Console.WriteLine($"[error talking to {_client.Name}: {ex.Message}]");
                 return;
             }
             spinner.Stop();
@@ -340,7 +343,7 @@ class CodingAgent
             // good reply proves the model can still produce valid output.
             streamRetries = 0;
 
-            _history.AddAssistant(response.Content, response.ToolCalls);
+            _history.AddAssistant(response.Content, response.ToolCalls, response.Reasoning);
 
             // No tool calls means the streamed text was the final answer.
             if (response.ToolCalls.Count == 0)
@@ -418,7 +421,7 @@ class CodingAgent
                 // happened without duplicating the project's contents.
                 _logger.LogInformation("Tool {ToolName} on {ToolSubject}: {ToolOutcome}",
                     name, SubjectOf(name, call.Function.Arguments), Summarize(result));
-                _history.AddToolResult(name, result, SubjectOf(name, call.Function.Arguments));
+                _history.AddToolResult(name, result, SubjectOf(name, call.Function.Arguments), call.Id);
 
                 // Honor Ctrl+C between tool calls too, not just while the
                 // model is generating.

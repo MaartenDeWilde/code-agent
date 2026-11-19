@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using CodeAgent.Llm;
 using CodeAgent.Ollama;
 
 namespace CodeAgent.Tests;
@@ -74,14 +75,14 @@ public class OllamaClientTests
     }
 
     [Fact]
-    public async Task ChatAsync_ErrorChunk_ThrowsOllamaStreamException()
+    public async Task ChatAsync_ErrorChunk_ThrowsModelStreamException()
     {
         // The failure seen live: Ollama's tool-call parser dying mid-stream.
         var client = ClientServing(
             """{"message":{"role":"assistant","content":"partial"},"done":false}""",
             """{"error":"XML syntax error on line 2: element <function> closed by </parameter>"}""");
 
-        var ex = await Assert.ThrowsAsync<OllamaStreamException>(() =>
+        var ex = await Assert.ThrowsAsync<ModelStreamException>(() =>
             client.ChatAsync("m", AnyHistory, tools: [], contextTokens: 8192, onToken: _ => { }));
 
         Assert.Contains("XML syntax error", ex.Message);
@@ -96,7 +97,7 @@ public class OllamaClientTests
                   + "I'll add the using statement and fix the redundant code.\n";
         var looping = string.Concat(Enumerable.Repeat(cycle, 8));
 
-        Assert.True(OllamaClient.LooksLikeRepetitionLoop(looping));
+        Assert.True(ReplyChecks.LooksLikeRepetitionLoop(looping));
     }
 
     [Fact]
@@ -107,7 +108,7 @@ public class OllamaClientTests
         var legitimate = string.Concat(Enumerable.Range(1, 8).Select(i =>
             $"Step {i}: change file number {i} accordingly.\n```\nif (x) {{\n}}\n```\n| --- | --- |\n"));
 
-        Assert.False(OllamaClient.LooksLikeRepetitionLoop(legitimate));
+        Assert.False(ReplyChecks.LooksLikeRepetitionLoop(legitimate));
     }
 
     [Fact]
@@ -119,7 +120,7 @@ public class OllamaClientTests
             new { message = new { role = "assistant", content = looping }, done = false });
         var client = ClientServing(chunk);
 
-        var ex = await Assert.ThrowsAsync<OllamaStreamException>(() =>
+        var ex = await Assert.ThrowsAsync<ModelStreamException>(() =>
             client.ChatAsync("m", AnyHistory, tools: [], contextTokens: 8192, onToken: _ => { }));
 
         Assert.Contains("repeating", ex.Message);

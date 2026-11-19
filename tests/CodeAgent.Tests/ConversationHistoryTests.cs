@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodeAgent.Agent;
+using CodeAgent.Llm;
 using CodeAgent.Ollama;
 
 namespace CodeAgent.Tests;

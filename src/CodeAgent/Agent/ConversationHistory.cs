@@ -1,5 +1,5 @@
 using System.Text.Json;
-using CodeAgent.Ollama;
+using CodeAgent.Llm;
 
 namespace CodeAgent.Agent;
 
@@ -45,18 +45,28 @@ class ConversationHistory
     public void AddUser(string content) =>
         Add(new ChatMessage { Role = "user", Content = content });
 
-    public void AddAssistant(string content, List<ToolCall> toolCalls) =>
+    public void AddAssistant(string content, List<ToolCall> toolCalls, string? reasoning = null) =>
         Add(new ChatMessage
         {
             Role = "assistant",
             Content = content,
-            ToolCalls = toolCalls.Count > 0 ? toolCalls : null
+            ToolCalls = toolCalls.Count > 0 ? toolCalls : null,
+            Reasoning = reasoning
         });
 
     /// <param name="subject">The call's main argument (file path, pattern,
     /// command), used to describe the result if it is later removed.</param>
-    public void AddToolResult(string toolName, string result, string? subject = null) =>
-        Add(new ChatMessage { Role = "tool", ToolName = toolName, Content = result, ToolSubject = subject });
+    /// <param name="toolCallId">The id of the call this answers, for
+    /// backends that pair results to calls by id.</param>
+    public void AddToolResult(string toolName, string result, string? subject = null, string? toolCallId = null) =>
+        Add(new ChatMessage
+        {
+            Role = "tool",
+            ToolName = toolName,
+            Content = result,
+            ToolSubject = subject,
+            ToolCallId = toolCallId
+        });
 
     private void Add(ChatMessage message)
     {
@@ -115,8 +125,9 @@ class ConversationHistory
             {
                 var names = string.Join(", ", message.ToolCalls.Select(c => c.Function.Name));
                 var note = $"[earlier tool calls removed to save space: {names}]";
-                total -= message.ToolCalls.Sum(ArgumentSize) + message.Content.Length;
+                total -= message.ToolCalls.Sum(ArgumentSize) + message.Content.Length + (message.Reasoning?.Length ?? 0);
                 message.ToolCalls = null;
+                message.Reasoning = null;
                 message.Content = string.IsNullOrEmpty(message.Content) ? note : $"{message.Content}\n{note}";
                 total += message.Content.Length;
             }
@@ -126,7 +137,7 @@ class ConversationHistory
     // Approximate size of a message as the model sees it, including tool-call
     // arguments, which can dwarf the visible content.
     private static int SizeOf(ChatMessage message) =>
-        message.Content.Length + (message.ToolCalls?.Sum(ArgumentSize) ?? 0);
+        message.Content.Length + (message.Reasoning?.Length ?? 0) + (message.ToolCalls?.Sum(ArgumentSize) ?? 0);
 
     private static int ArgumentSize(ToolCall call) =>
         call.Function.Arguments.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null

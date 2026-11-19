@@ -1,6 +1,6 @@
 # C# Coding Agent
 
-A terminal coding agent that runs entirely on **local LLMs** via [Ollama](https://ollama.com) — built from scratch in C# / .NET 8, with no agent framework. Point it at a project folder, give it a task, and it explores the code, edits files, runs the build, and iterates until the work is done and verified.
+A terminal coding agent that runs entirely on **local LLMs** via [Ollama](https://ollama.com), [Embla](https://github.com/sevren-ai/embla-metal) or any OpenAI-compatible server (mlx_lm, …) — built from scratch in C# / .NET 8, with no agent framework. Point it at a project folder, give it a task, and it explores the code, edits files, runs the build, and iterates until the work is done and verified.
 
 The interesting part isn't the loop itself — it's everything needed to make *small local models* reliable inside that loop: malformed-reply recovery, fuzzy edit matching, context-window management, layered guardrails, and enforced build verification. Those are documented in [Design decisions](#design-decisions) below.
 
@@ -40,7 +40,9 @@ flowchart TD
 | `Tools/ProjectOrientation.cs` | Project layout + key config files appended to the system prompt, so the model doesn't rediscover the stack every task |
 | `Tools/ProjectVerification.cs` | Detects the project's verification command (`dotnet test` / `dotnet build`) |
 | `Guardrails/GuardrailPipeline.cs` | Named regex rails for user input and model-proposed shell commands |
+| `Llm/ChatModels.cs` | Backend-neutral message models, the `IChatClient` interface, and the list of selectable model servers |
 | `Ollama/OllamaClient.cs` | Minimal streaming HTTP client for `/api/chat` with native tool calling |
+| `OpenAi/OpenAiClient.cs` | Streaming SSE client for OpenAI-compatible `/v1/chat/completions` (Embla, mlx_lm, …) |
 
 ## Design decisions
 
@@ -88,13 +90,16 @@ The recovery mechanisms above exist precisely because of this spread.
 Prerequisites:
 
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
-- [Ollama](https://ollama.com) running locally, with a model that supports **native tool calling** installed (e.g. `ollama pull qwen2.5:14b` — or any tool-capable model you prefer)
+- A local model server, one of:
+  - [Ollama](https://ollama.com), with a model that supports **native tool calling** installed (e.g. `ollama pull qwen2.5:14b` — or any tool-capable model you prefer)
+  - [Embla](https://github.com/sevren-ai/embla-metal) (Apple silicon, macOS 15+): `swift run -c release embla download`, then `swift run -c release embla serve` — it listens on `127.0.0.1:8080` with a 32k context by default (`--context` to change it; give the agent the same value)
+  - `mlx_lm.server` on `localhost:8080`
 
 ```bash
 dotnet run --project src/CodeAgent
 ```
 
-The agent asks for a working folder (it will only read/write inside it), a model, and a context window size, then drops you into a REPL:
+The agent asks for a working folder (it will only read/write inside it), a model server (`ollama`, `embla` or `mlx`), a model, and a context window size, then drops you into a REPL:
 
 ```
 <task>          give the agent a coding task

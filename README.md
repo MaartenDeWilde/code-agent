@@ -1,6 +1,8 @@
 # C# Coding Agent
 
-A terminal coding agent that runs entirely on **local LLMs** via [Ollama](https://ollama.com), [Embla](https://github.com/sevren-ai/embla-metal) or any OpenAI-compatible server (mlx_lm, …) — built from scratch in C# / .NET 8, with no agent framework. Point it at a project folder, give it a task, and it explores the code, edits files, runs the build, and iterates until the work is done and verified.
+[![CI](https://github.com/MaartenDeWilde/code-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MaartenDeWilde/code-agent/actions/workflows/ci.yml)
+
+A terminal coding agent that runs entirely on **local LLMs** via [Ollama](https://ollama.com), [Embla](https://github.com/sevren-ai/embla-metal) or any OpenAI-compatible server (mlx_lm, …) — built from scratch in C# / .NET 10, with no agent framework. Point it at a project folder, give it a task, and it explores the code, edits files, runs the build, and iterates until the work is done and verified.
 
 The interesting part isn't the loop itself — it's everything needed to make *small local models* reliable inside that loop: malformed-reply recovery, fuzzy edit matching, context-window management, layered guardrails, and enforced build verification. Those are documented in [Design decisions](#design-decisions) below.
 
@@ -72,16 +74,17 @@ File changes taint the session as *unverified*; only a passing run of the detect
 
 Regex guardrails are the cheap, instant first line — they catch obvious prompt injection and destructive requests, but a determined user can always rephrase. So the dangerous actions themselves are *also* gated: every shell command and file overwrite requires interactive confirmation (with opt-in session-scoped approval per command program — commands containing shell operators like `;`, `|`, `$()` never qualify for blanket approval), file access is path-checked *and* symlink-checked against the working folder, and known-catastrophic commands are refused before the user is even asked — confirmation prompts get clicked through on autopilot.
 
-### Model notes
+### Tested LLMs
 
 Observed with this agent's tool-calling workload:
 
-| Model | Behavior |
-|---|---|
-| `gemma4:12b-mlx` | Most reliable native tool calling; the default |
-| `qwen3.5` | Trips Ollama's tool-call parser (XML syntax errors mid-stream) |
-| `qwen2.5-coder` | Fakes tool calls as plain text instead of native calls |
-| `gpt-oss` | Leaks (sometimes degraded) control tokens like `<channel\|>` |
+| Model | Server | Tool calling | Notes |
+|---|---|---|---|
+| `gemma4:12b-mlx` | Ollama | ✅ Reliable | Most reliable native tool calling; the Ollama default |
+| `Embla1-4bit` | [embla-metal](https://github.com/sevren-ai/embla-metal) | ✅ Reliable | Reliable native tool calling; the `embla` backend default |
+| `qwen3.5` | Ollama | ⚠️ Unreliable | Trips Ollama's tool-call parser (XML syntax errors mid-stream) |
+| `qwen2.5-coder` | Ollama | ❌ Broken | Fakes tool calls as plain text instead of native calls |
+| `gpt-oss` | Ollama | ⚠️ Unreliable | Leaks (sometimes degraded) control tokens like `<channel\|>` |
 
 The recovery mechanisms above exist precisely because of this spread.
 
@@ -89,7 +92,7 @@ The recovery mechanisms above exist precisely because of this spread.
 
 Prerequisites:
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - A local model server, one of:
   - [Ollama](https://ollama.com), with a model that supports **native tool calling** installed (e.g. `ollama pull qwen2.5:14b` — or any tool-capable model you prefer)
   - [Embla](https://github.com/sevren-ai/embla-metal) (Apple silicon, macOS 15+): `swift run -c release embla download`, then `swift run -c release embla serve` — it listens on `127.0.0.1:8080` with a 32k context by default (`--context` to change it; give the agent the same value)
